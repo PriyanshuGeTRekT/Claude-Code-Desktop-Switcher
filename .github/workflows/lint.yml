@@ -1,0 +1,60 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A syntax error should be reported as a syntax error, not buried in lint output.
+      - name: Parse check
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -Path . -Filter *.ps1 -Recurse | ForEach-Object {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) {
+              $failed = $true
+              foreach ($e in $errors) {
+                Write-Host "::error file=$($_.Name),line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              }
+            } else {
+              Write-Host "ok: $($_.Name)"
+            }
+          }
+          if ($failed) { throw 'One or more scripts failed to parse.' }
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+
+      # Warnings are surfaced as annotations but do not fail the build. Only errors do,
+      # so a stylistic rule change upstream can never break contributors' pull requests.
+      - name: Analyze
+        shell: pwsh
+        run: |
+          $results = @(Invoke-ScriptAnalyzer -Path . -Recurse)
+          $root = (Get-Location).Path + [System.IO.Path]::DirectorySeparatorChar
+
+          foreach ($r in $results) {
+            $file = if ($r.ScriptPath) { $r.ScriptPath.Replace($root, '') } else { 'unknown' }
+            $level = if ($r.Severity -eq 'Error') { 'error' } else { 'warning' }
+            Write-Host "::$level file=$file,line=$($r.Line)::$($r.RuleName): $($r.Message)"
+          }
+
+          $errors = @($results | Where-Object { $_.Severity -eq 'Error' })
+          $warnings = @($results | Where-Object { $_.Severity -eq 'Warning' })
+          Write-Host "Errors: $($errors.Count)  Warnings: $($warnings.Count)"
+
+          if ($errors.Count -gt 0) {
+            throw "PSScriptAnalyzer reported $($errors.Count) error(s)."
+          }

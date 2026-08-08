@@ -1,0 +1,12 @@
+# Windows-only tooling. Batch files in particular must keep CRLF or cmd.exe can
+# mis-parse them, so don't leave line endings up to each contributor's git config.
+* text=auto
+
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+LICENSE text eol=lf
+.gitignore text eol=lf

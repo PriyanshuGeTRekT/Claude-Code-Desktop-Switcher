@@ -1,0 +1,60 @@
+name: Bug report
+description: Something does not work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. The details below are what usually make a bug reproducible,
+        so please fill in as much as you can.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: |
+        1. Opened the switcher
+        2. Clicked Launch on the "Work" profile
+        3. Nothing appeared
+    validations:
+      required: true
+
+  - type: dropdown
+    id: claude-build
+    attributes:
+      label: Which Claude desktop build
+      description: |
+        If you are unsure, run this and pick based on whether it returns anything:
+        `Get-AppxPackage -Name Claude`
+      options:
+        - Store / Microsoft Store (MSIX)
+        - Installed from an installer
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: "Run: `winver`, or `[System.Environment]::OSVersion.Version`"
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+
+  - type: textarea
+    id: list-output
+    attributes:
+      label: Output of -List
+      description: "Run: `.\\ClaudeSwitcher.ps1 -List`"
+      render: text
+
+  - type: textarea
+    id: error-log
+    attributes:
+      label: Error log
+      description: |
+        Contents of `%LOCALAPPDATA%\ClaudeProfiles\switcher-error.log`, if there is
+        anything in it. Leave blank if the file does not exist.
+      render: text

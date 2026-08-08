@@ -1,0 +1,47 @@
+name: Installer build report
+description: Confirm whether detection works on a non Store install of Claude
+labels: [installer-build, help wanted]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Development happened on the Microsoft Store (MSIX) build of Claude desktop, so the
+        code that detects a regular installer build has never run against a real install.
+        If you have one, this report is the single most useful thing you can contribute.
+
+  - type: dropdown
+    id: detected
+    attributes:
+      label: Did the tool find your Claude install?
+      options:
+        - "Yes, it worked with no extra arguments"
+        - "Only after I passed -ClaudePath"
+        - "No, it could not find Claude at all"
+    validations:
+      required: true
+
+  - type: textarea
+    id: probe
+    attributes:
+      label: Probe output
+      description: Please paste the output of all four commands.
+      value: |
+        Get-AppxPackage -Name Claude | Select-Object PackageFamilyName, InstallLocation
+        Test-Path "$env:LOCALAPPDATA\AnthropicClaude"
+        Test-Path "$env:APPDATA\Claude"
+        .\ClaudeSwitcher.ps1 -List
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: exe-path
+    attributes:
+      label: Full path to your Claude.exe
+      placeholder: C:\Users\you\AppData\Local\AnthropicClaude\app-1.2.3\claude.exe
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Did launching a second profile work? Did both accounts stay signed in?
