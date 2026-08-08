@@ -21,6 +21,11 @@ Test-Path "$env:APPDATA\Claude"
 
 Reports from Windows 10 are also welcome, since testing happened on Windows 11.
 
+One request: those commands print paths containing your Windows username, and issues here
+are public and permanent. Replace it with `USERNAME` before pasting. The shape of the path
+is the useful part, never your actual account name. The same goes for the error log and
+for any screenshots.
+
 ## Getting set up
 
 There is no build step and no dependencies. Clone the repo and run the script:

@@ -8,6 +8,11 @@ body:
         Thanks for reporting. The details below are what usually make a bug reproducible,
         so please fill in as much as you can.
 
+        **Before you paste anything:** profile paths and the error log both contain your
+        Windows username, for example `C:\Users\yourname\AppData\...`. Issues here are
+        public and permanent. Please replace your username with `USERNAME` in anything you
+        paste. Nothing about this tool needs your real one.
+
   - type: textarea
     id: what-happened
     attributes:
@@ -47,7 +52,9 @@ body:
     id: list-output
     attributes:
       label: Output of -List
-      description: "Run: `.\\ClaudeSwitcher.ps1 -List`"
+      description: |
+        Run: `.\ClaudeSwitcher.ps1 -List`
+        Replace your Windows username with `USERNAME` before pasting.
       render: text
 
   - type: textarea
@@ -57,4 +64,5 @@ body:
       description: |
         Contents of `%LOCALAPPDATA%\ClaudeProfiles\switcher-error.log`, if there is
         anything in it. Leave blank if the file does not exist.
+        This file contains file paths, so replace your username with `USERNAME` first.
       render: text

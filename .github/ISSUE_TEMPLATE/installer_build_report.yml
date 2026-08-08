@@ -9,6 +9,10 @@ body:
         code that detects a regular installer build has never run against a real install.
         If you have one, this report is the single most useful thing you can contribute.
 
+        **Before you paste anything:** install paths contain your Windows username, and
+        issues here are public and permanent. Please replace it with `USERNAME`. The shape
+        of the path is what matters, never your actual account name.
+
   - type: dropdown
     id: detected
     attributes:
