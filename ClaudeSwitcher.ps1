@@ -483,7 +483,7 @@ function Update-List {
     foreach ($p in $profiles) {
         $item = New-Object System.Windows.Forms.ListViewItem($p.Name)
         if ($p.Pid) {
-            $item.SubItems.Add("Running  ·  pid $($p.Pid)") | Out-Null
+            $item.SubItems.Add("Running (pid $($p.Pid))") | Out-Null
             $item.UseItemStyleForSubItems = $false
             $item.SubItems[1].ForeColor = $running
         } else {
@@ -515,7 +515,9 @@ function Update-List {
 
     $count = ($profiles | Where-Object { $_.Pid }).Count
     $label = $(if ($script:ClaudeApp.Version -eq 'unknown') { $script:ClaudeApp.Kind } else { $script:ClaudeApp.Version })
-    $status.Text = "$($profiles.Count) profile(s), $count running   ·   Claude $label"
+    # Kept deliberately ASCII only: without a BOM, Windows PowerShell 5.1 reads this file
+    # using the system codepage, so non-ASCII here renders as garbage on other locales.
+    $status.Text = "$($profiles.Count) profile(s), $count running   |   Claude $label"
 }
 
 function Get-SelectedProfile {
