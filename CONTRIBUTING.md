@@ -53,16 +53,37 @@ Invoke-ScriptAnalyzer -Path .\ClaudeSwitcher.ps1
 Then actually run the thing. There are no automated tests, because almost everything here
 touches real processes, real windows and real profile directories. At minimum, check that:
 
-- The window opens and lists your profiles with correct running state.
-- Creating a profile, launching it and deleting it all work.
-- `-List`, `-Shortcut` and `-Install` still behave.
-- A profile launched from a desktop shortcut opens a **visible** Claude window.
+- The window opens and lists your profiles with correct running state, including while
+  Claude Code sessions are open (they run a `claude.exe` of their own).
+- **Add account** (and `-AddAccount`) creates `Account N` and opens it at the sign-in
+  screen, and **Switch to** on an open profile brings its window forward rather than
+  starting a second copy.
+- Rename, delete (refused while the profile is open) and **Transfer chats** work.
+- Closing the window leaves it in the tray, and launching the switcher again brings the
+  same window back instead of starting a second one.
+- `-List`, `-Launch`, `-Shortcut`, `-Tray` and `-Install` still behave.
+- A profile launched from a desktop shortcut opens a **visible** Claude window, and no
+  console window flashes up on the way.
 
 That last one matters more than it looks. See the notes below.
 
-## Two traps worth knowing about
+### Testing without touching your real accounts
 
-Both of these have already caused bugs in this repo, so they are worth reading before you
+Everything the switcher writes lives under `%LOCALAPPDATA%` and `%APPDATA%`, and it will
+launch whatever `-ClaudePath` points at. So in a fresh PowerShell window:
+
+```powershell
+$env:LOCALAPPDATA = "$env:TEMP\ccsw\local"; $env:APPDATA = "$env:TEMP\ccsw\roaming"
+.\ClaudeSwitcher.ps1 -ClaudePath C:\path\to\any-windowed-app.exe
+```
+
+gives you a throwaway set of profiles. Any small windowed program renamed to `Claude.exe`
+works as a stand-in, which also makes running detection work. Desktop and Start menu
+shortcuts still go to the real locations, so prefer `-Shortcut <name> -To <folder>` there.
+
+## Traps worth knowing about
+
+All of these have already caused bugs in this repo, so they are worth reading before you
 change anything.
 
 **PowerShell variable names are case insensitive, and parameters live in script scope.**
@@ -77,6 +98,16 @@ inherits the same show state unless told otherwise. This is why the script hides
 console rather than being launched with `-WindowStyle Hidden`, and why Claude is launched
 with an explicit `-WindowStyle Normal`. If you touch launching or shortcut creation,
 verify a real window actually appears rather than trusting that the process started.
+Shortcuts now run PowerShell under `conhost.exe --headless`, which has no window at all and
+passes no hidden show state on, so keep them that way.
+
+**`$_` changes meaning inside `switch`.** In a WinForms event handler `$_` is the event
+args, but inside a `switch` block it becomes the value being switched on. Setting
+`$_.Handled` there fails, and WinForms reports it with its own "Unhandled exception"
+dialog. Copy the event args to a variable before the `switch`.
+
+**Keep the script ASCII only.** Without a BOM, Windows PowerShell 5.1 reads the file in
+the system codepage, so any non-ASCII character renders as garbage on other locales.
 
 ## Style
 
@@ -89,3 +120,7 @@ person will otherwise remove it.
 Open an issue with your Windows version, whether your Claude desktop is the Store build or
 an installer build, and the contents of `%LOCALAPPDATA%\ClaudeProfiles\switcher-error.log`
 if there is anything in it.
+
+The switcher's own files (installed copy, icons) live in
+`%LOCALAPPDATA%\ClaudeProfiles\.switcher`, and settings, labels and colours in
+`%LOCALAPPDATA%\ClaudeProfiles\settings.json`.

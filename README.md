@@ -1,149 +1,243 @@
+<div align="center">
+
 # Claude Profile Switcher
 
-Run two or more Claude desktop accounts on the same Windows machine **at the same time**,
-without ever signing out of the one you already have.
+**Run several Claude desktop accounts on one Windows PC, side by side, without ever signing out.**
 
-No patching, no proxying, no credential juggling. The Claude desktop app is an Electron
-app, so it honours `--user-data-dir`. This is a small launcher built around that.
+[![Stars](https://img.shields.io/github/stars/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher?style=flat-square&color=cb7b5d)](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/stargazers)
+[![Downloads](https://img.shields.io/github/downloads/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/total?style=flat-square&color=cb7b5d)](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/releases)
+[![Views](https://visitor-badge.laobi.icu/badge?page_id=PriyanshuGeTRekT.Claude-Code-Desktop-Switcher&left_text=views)](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher)
+[![Lint](https://img.shields.io/github/actions/workflow/status/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/lint.yml?branch=main&style=flat-square&label=lint)](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/actions/workflows/lint.yml)
+[![License](https://img.shields.io/github/license/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher?style=flat-square)](LICENSE)
+<br>
+![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square&logo=windows)
+![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-5391FE?style=flat-square&logo=powershell&logoColor=white)
+![No dependencies](https://img.shields.io/badge/dependencies-none-2e7d4a?style=flat-square)
 
+<img src="docs/images/switcher.png" alt="The Claude Profile Switcher window listing four accounts" width="720">
+
+</div>
+
+## Highlights
+
+|  |  |
+| --- | --- |
+| **Add an account in one click** | **Add account** opens a fresh Claude window at the sign-in screen. Sign in and you're done. |
+| **Concurrent accounts** | Every account runs in its own window. Open as many as you like at the same time. |
+| **One click to switch** | Launch a profile, or bring it to the front if it is already open. Also from the tray. |
+| **Move Claude Code chats** | Copy chats from one account to another and carry on where you left off. |
+| **Icons you can tell apart** | Each profile gets a coloured badge for its desktop and Start menu shortcuts. |
+| **Nothing to install** | One PowerShell script. No patching, no proxy, no credential juggling. |
+| **Your original stays put** | The account you already have is never touched and keeps auto update and `claude://` links. |
+
+## Quick start
+
+**One line**, from the latest release:
+
+```powershell
+irm https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/releases/latest/download/ClaudeSwitcher.ps1 -OutFile "$env:TEMP\ClaudeSwitcher.ps1"; powershell -ExecutionPolicy Bypass -File "$env:TEMP\ClaudeSwitcher.ps1" -Install
 ```
-┌─ Claude accounts ─────────────────────────────────┐
-│  Profile     Status                  Last used    │
-│  Default     Running · pid 10760     today 14:02  │  <- your original account
-│  Work        Not running             yesterday    │
-│  Personal    Running · pid 23180     today 13:41  │
-│                                                   │
-│  [ Launch ] [ New profile ] [ Add to desktop ]    │
-└───────────────────────────────────────────────────┘
-```
 
-## Why
-
-Claude desktop signs in one account at a time. The usual workaround is signing out and
-back in, which is slow and loses your place. A profile directory is all that actually
-distinguishes one logged in account from another, so pointing separate instances at
-separate directories gets you genuinely concurrent sessions.
-
-## Requirements
-
-- Windows 10 or 11
-- Windows PowerShell 5.1, which ships with Windows, so there is nothing to install
-- The Claude desktop app
-
-## Install
+**Or from a clone:**
 
 ```powershell
 git clone https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher.git
-cd Claude-Code-Desktop-Switcher
-powershell -ExecutionPolicy Bypass -File .\ClaudeSwitcher.ps1 -Install
+powershell -ExecutionPolicy Bypass -File .\Claude-Code-Desktop-Switcher\ClaudeSwitcher.ps1 -Install
 ```
 
-That puts a **Claude Profile Switcher** shortcut on your desktop and in the Start menu.
-You can also just double click `Claude Profile Switcher.cmd`.
+`-Install` copies the switcher to `%LOCALAPPDATA%\ClaudeProfiles\.switcher`, adds
+**Claude Profile Switcher** to the desktop and Start menu, adds **Claude - Add account** to the
+Start menu, and opens the switcher. The downloaded copy is no longer needed afterwards, so
+moving or deleting it breaks nothing.
 
-If you downloaded a ZIP instead of cloning, Windows marks the files as untrusted. Unblock
-them first:
+> [!TIP]
+> Downloaded a ZIP instead? Run `Get-ChildItem -Recurse | Unblock-File` in the folder first.
 
-```powershell
-Get-ChildItem -Recurse | Unblock-File
-```
+## Using it
 
-## Use
+<img src="docs/images/first-run.png" alt="The switcher on first run, with only the original account and a prompt to click Add account" width="600">
 
-1. **New profile**, then name it, for example `Work`.
-2. Select it and click **Launch**. A second Claude window opens at the sign in screen.
-3. Sign in with your other account.
+1. Click **Add account**. A new Claude window opens at the sign-in screen.
+2. Sign in with your other account. That's it: both accounts stay signed in from now on.
+3. Optionally press <kbd>F2</kbd> to rename it from `Account 2` to something like `Work`.
 
-Both accounts now stay signed in indefinitely. **Add to desktop** gives a profile its own
-icon so you can skip the switcher entirely and go straight to the account you want. Those
-shortcuts pin to the taskbar and Start menu like anything else.
+You can also add an account without opening the switcher: search Start for
+**Claude - Add account**, pick **Add account** from the tray icon, or run
+`.\ClaudeSwitcher.ps1 -AddAccount`.
+
+| Action | Button | Keyboard |
+| --- | --- | --- |
+| Open a profile, or switch to it if it is open | **Launch** / **Switch to**, or double-click | <kbd>Enter</kbd> |
+| Add an account, opens straight to sign-in | **Add account** | <kbd>Ctrl</kbd>+<kbd>N</kbd> |
+| Rename (only the label, sign-in is unaffected) | **Rename** | <kbd>F2</kbd> |
+| Desktop and Start menu shortcuts | **Add shortcuts** | |
+| Copy Claude Code chats to another account | **Transfer chats** | |
+| Delete a profile and its shortcuts | **Delete** | <kbd>Del</kbd> |
+| Open the profile folder | right-click, **Open folder** | |
+
+Right-click any profile for the same actions.
+
+### Tray
+
+Closing the window keeps the switcher in the notification area. Right-click the tray icon to
+jump to any account (open ones are ticked), add an account, or turn on **Start with Windows**. Untick
+**Keep running in the tray** in the window if you would rather it quit on close.
+
+### Shortcuts
+
+<img src="docs/images/icons.png" alt="Shortcut icons: plain Claude for Default, then coloured W, P and C badges" width="600">
+
+**Add shortcuts** puts a `Claude - <name>` shortcut on the desktop and in the Start menu, so
+you can search for an account or pin it and skip the switcher entirely. Each profile keeps its
+colour, and clicking a shortcut for an account that is already open simply brings it forward.
+
+### Moving Claude Code chats between accounts
+
+<img src="docs/images/transfer.png" alt="The transfer dialog with three chats ticked" width="600">
+
+Select a profile, click **Transfer chats**, tick the chats and pick where they go. The chat
+stays in the original account as well. Both copies continue the same history, so finish in
+one account before picking it up in the other.
+
+> [!NOTE]
+> The target account needs to have opened the Code tab once, so it has somewhere to put
+> the chats. If it is running, quit and reopen it to see them. This feature is new; please
+> [open an issue](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/issues)
+> if a transferred chat does not show up or resume.
 
 ## Command line
 
-```powershell
-.\ClaudeSwitcher.ps1                  # open the window
-.\ClaudeSwitcher.ps1 -Launch Work     # launch a profile directly
-.\ClaudeSwitcher.ps1 -List            # print profiles and what is running
-.\ClaudeSwitcher.ps1 -Shortcut Work   # desktop shortcut for one profile
-.\ClaudeSwitcher.ps1 -Install         # create the switcher's own shortcuts
-.\ClaudeSwitcher.ps1 -ClaudePath "C:\path\to\Claude.exe"   # if auto detection fails
-```
+| Command | Does |
+| --- | --- |
+| `.\ClaudeSwitcher.ps1` | Open the window |
+| `.\ClaudeSwitcher.ps1 -AddAccount` | Add an account and open Claude at its sign-in screen |
+| `.\ClaudeSwitcher.ps1 -Launch Work` | Open a profile, or bring it forward if it is open |
+| `.\ClaudeSwitcher.ps1 -List` | Print profiles and which are running |
+| `.\ClaudeSwitcher.ps1 -Shortcut Work` | Desktop and Start menu shortcuts for one profile |
+| `.\ClaudeSwitcher.ps1 -Shortcut Work -To <dir>` | A shortcut in a folder of your choice |
+| `.\ClaudeSwitcher.ps1 -Tray` | Start in the tray without the window |
+| `.\ClaudeSwitcher.ps1 -Install` | Install (or refresh an install and its shortcuts), then open the switcher |
+| `.\ClaudeSwitcher.ps1 -ClaudePath <exe>` | Point at `Claude.exe` if detection fails (remembered) |
 
-Re-run `-Install` if you move the folder, since shortcuts point at the script by path.
+`-Launch` and `-Shortcut` accept either a profile's name or its folder name.
 
 ## How it works
 
-A profile is just a directory. It holds its own cookie jar, `Local Storage` and
-`config.json`, so each one is a fully independent login. Electron's single instance lock
-is per user-data-dir, which is why instances pointed at different directories run
-concurrently instead of focusing each other's window.
+The Claude desktop app is built on Electron, and Electron honours `--user-data-dir`. A
+profile is nothing more than a directory with its own cookie jar, Local Storage and
+`config.json`, so each one is a fully independent login. Electron's single instance lock is
+per directory too, which is why instances pointed at different directories run side by side
+instead of focusing each other.
 
-Claude ships in two shapes on Windows, and they store data in different places:
+```mermaid
+flowchart LR
+    S["Switcher<br/>window, tray, shortcuts"]
+    S -->|shell:AppsFolder| D["Claude<br/>Default"]
+    S -->|--user-data-dir| W["Claude<br/>Work"]
+    S -->|--user-data-dir| P["Claude<br/>Personal"]
+    D --- DD[("Claude's own data<br/>never touched")]
+    W --- WD[("ClaudeProfiles\Work")]
+    P --- PD[("ClaudeProfiles\Personal")]
+```
 
-| Build | Executable | Profile data |
+Claude ships in two shapes on Windows, and the switcher detects whichever you have:
+
+| Build | Executable | Default profile data |
 | --- | --- | --- |
 | Store / MSIX | inside the package's `WindowsApps` folder | `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude` |
 | Installer | for example `%LOCALAPPDATA%\AnthropicClaude` | `%APPDATA%\Claude` |
 
-The script resolves whichever you have. It checks the Store package first, then registry
-uninstall entries, then the usual install directories, with `-ClaudePath` as a manual
-override that gets remembered.
+<details>
+<summary><b>Details that matter</b></summary>
 
-Two details that matter:
+- **`Default` is never touched.** On the Store build it is started through the shell app model
+  rather than by running the `.exe`, so it keeps full package identity: `claude://` links, the
+  native messaging host and auto update behave exactly as before. Profiles this tool creates
+  live in `%LOCALAPPDATA%\ClaudeProfiles`, nowhere near Claude's own data.
+- **Install paths contain the version number**, so they change with every update. Shortcuts
+  resolve the executable when clicked and carry their own icon files, so they keep working
+  and keep their icons after Claude updates itself.
+- **Running detection** only counts the desktop app's own process. The Claude Code CLI is also
+  called `claude.exe` and the desktop app starts one per Code session; those are ignored.
+- **Renaming** changes a label only. The folder name is a profile's permanent id, because
+  Electron stores absolute paths inside its data.
+- **Chat transfer** copies the small per-chat file the desktop app keeps under
+  `claude-code-sessions\<account>\<organisation>` into the other profile, re-pointed at that
+  profile's account. The transcript itself is kept by Claude Code outside the profile.
 
-- **`Default` is never touched.** Your existing account keeps using its original
-  directory. On the Store build it is launched through the shell app model rather than by
-  running the `.exe` directly, so it keeps full package identity. `claude://` links, the
-  native messaging host and auto update all behave exactly as before. Profiles this tool
-  creates live in `%LOCALAPPDATA%\ClaudeProfiles`, nowhere near Claude's own data.
-- **Install paths contain the version number**, so they change on every update. The
-  executable is resolved at click time rather than baked into shortcuts, which keeps
-  shortcuts working after Claude updates itself.
+</details>
 
 ## What has been verified
 
-Tested end to end on Windows 11 against the **Store (MSIX) build**, Claude `1.26832.0.0`.
-That covers concurrent instances, independent cookie jars, profile creation and deletion,
-shortcut generation, and launching from a shortcut.
+Tested on Windows 11 against the **Store (MSIX) build**, Claude `2.16120.0.0`: `-Install`
+and its shortcuts, **Add account** opening a real Claude window at the sign-in screen,
+switching to (and restoring) an open account, running detection alongside Claude Code
+sessions, shortcut icons, every tray menu item, and <kbd>Ctrl</kbd>+<kbd>N</kbd>. Rename,
+delete, single instance behaviour and chat transfer (on sample data) were exercised end to
+end against a stand-in `Claude.exe`.
 
-The **installer build** detection path is implemented but has not been tested, because
-there was no such install available to try it against. If you have one, `-List` is a
-harmless way to check detection, and there is an
-[issue template](.github/ISSUE_TEMPLATE/installer_build_report.yml) for reporting what
-happened. That is the most useful contribution anyone can make right now.
+**Not yet verified:** the **installer build** (no such install was available) and **chat
+transfer between two real signed-in accounts**. If you can try either, `-List` is a harmless
+way to check detection, and there is an
+[issue template](.github/ISSUE_TEMPLATE/installer_build_report.yml) for reporting back. That
+is the most useful contribution anyone can make right now.
 
 ## Troubleshooting
 
-Anything fatal is written to `%LOCALAPPDATA%\ClaudeProfiles\switcher-error.log`, because a
-shortcut launched script has no console to print to.
+<details>
+<summary><b>"Could not find the Claude desktop app"</b></summary>
 
-**"Could not find the Claude desktop app"**. Pass `-ClaudePath` once, pointing at your
-`Claude.exe`. The choice is saved.
+Pass `-ClaudePath` once, pointing at your `Claude.exe`. The choice is saved.
+</details>
 
-**Script will not run**. Use `-ExecutionPolicy Bypass` as shown above, and `Unblock-File`
-if you downloaded a ZIP. The generated shortcuts already handle this.
+<details>
+<summary><b>The script will not run</b></summary>
 
-## Notes
+Use `-ExecutionPolicy Bypass` as shown above, and `Unblock-File` if you downloaded a ZIP. The
+generated shortcuts already handle this.
+</details>
 
-- Deleting a profile removes its directory, which signs that account out on this machine.
-  `Default` is protected.
-- A profile grows to a few hundred MB, mostly caches.
-- Each running instance is a full app, so budget roughly one Claude's worth of memory per
-  account.
-- This is only about the desktop app. The `claude` CLI is separate and uses its own
-  `CLAUDE_CONFIG_DIR` environment variable for the same purpose.
+<details>
+<summary><b>A shortcut does nothing</b></summary>
+
+Anything fatal is shown in a message box and written to
+`%LOCALAPPDATA%\ClaudeProfiles\switcher-error.log`. If you deleted or renamed a profile
+outside the switcher, its old shortcut will report that the profile no longer exists.
+</details>
+
+<details>
+<summary><b>Known limitations</b></summary>
+
+- Every instance shares Claude's taskbar identity, so open accounts group under one taskbar
+  button with the same icon. Hover to see each window.
+- A pinned profile shortcut shows up as a separate taskbar button from the window it opens.
+- `claude://` links always open in the `Default` account.
+- Each running account is a full copy of the app, so budget roughly one Claude's worth of
+  memory per account. A profile grows to a few hundred MB, mostly caches.
+- This is about the desktop app only. The `claude` CLI uses its own `CLAUDE_CONFIG_DIR`
+  environment variable for the same purpose.
+</details>
+
+## Star history
+
+<a href="https://star-history.com/#PriyanshuGeTRekT/Claude-Code-Desktop-Switcher&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=priyanshugetrekt/claude-code-desktop-switcher&type=Date&theme=dark">
+    <img alt="Star history chart" src="https://api.star-history.com/svg?repos=priyanshugetrekt/claude-code-desktop-switcher&type=Date" width="600">
+  </picture>
+</a>
 
 ## Contributing
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup,
-what to test before opening a PR, and two Windows specific traps that have already caused
-bugs here. Please also read the [Code of Conduct](CODE_OF_CONDUCT.md).
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, what to
+test before opening a PR, and the Windows specific traps that have already caused bugs here.
+Please also read the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Disclaimer
 
 Unofficial, and not affiliated with, endorsed by, or supported by Anthropic. It uses only
-documented Electron command line switches and does not modify the Claude application.
-Using multiple accounts is subject to Anthropic's terms of service.
+documented Electron command line switches and does not modify the Claude application. Using
+multiple accounts is subject to Anthropic's terms of service.
 
 ## License
 
