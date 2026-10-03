@@ -9,7 +9,7 @@
 
 ## How it was tested
 
-Please tick what you actually ran. There are no automated tests, because nearly everything
+Please tick what you actually ran. Chat-transfer regression tests cover session stores; most other behavior
 here touches real processes, windows and profile directories.
 
 - [ ] The window opens and lists profiles with the correct running state
