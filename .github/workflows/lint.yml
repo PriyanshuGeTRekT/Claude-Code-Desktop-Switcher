@@ -33,6 +33,14 @@ jobs:
           }
           if ($failed) { throw 'One or more scripts failed to parse.' }
 
+      - name: Chat transfer regression tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\ChatTransfer.Tests.ps1
+
+      - name: Chat transfer regression tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\ChatTransfer.Tests.ps1
+
       - name: Install PSScriptAnalyzer
         shell: pwsh
         run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
