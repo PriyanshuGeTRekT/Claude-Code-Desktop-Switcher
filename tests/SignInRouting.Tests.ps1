@@ -179,15 +179,24 @@ try {
     $null = Unregister-SignInRouter
     Assert (-not (Test-Path -LiteralPath $keys.Scheme)) 'Handler key we created was left behind'
 
-    # A bare claude key with no command, as the Store build can leave behind, survives a revert.
-    Set-RegistryValue $keys.Scheme '(default)' 'URL:claude'
-    Set-RegistryValue $keys.Scheme 'URL Protocol' ''
+    # A bare claude key, as the Store build leaves behind (URL Protocol only, no command and
+    # no description), comes back exactly as it was.
+    New-Item -Path $keys.Scheme -Force | Out-Null
+    Set-ItemProperty -LiteralPath $keys.Scheme -Name 'URL Protocol' -Value ''
     Register-SignInRouter
     Assert ((Get-Content -LiteralPath $script:HandlerBackupPath -Raw | ConvertFrom-Json).KeyExisted -eq $true) 'Existing key not recorded'
+    Assert ((Get-RegistryDefault $keys.Scheme) -eq 'URL:claude') 'Registration did not describe the key'
     $null = Unregister-SignInRouter
     Assert (Test-Path -LiteralPath $keys.Scheme) 'Pre-existing claude key deleted'
     Assert (-not (Test-Path -LiteralPath "$($keys.Scheme)\shell")) 'Our command left in the pre-existing key'
-    Assert (@((Get-Item -LiteralPath $keys.Scheme).Property) -contains 'URL Protocol') 'Pre-existing key lost its values'
+    $left = @((Get-Item -LiteralPath $keys.Scheme).Property)
+    Assert ($left -contains 'URL Protocol' -and $left -notcontains '(default)') "Pre-existing key not restored exactly: $($left -join ', ')"
+
+    # One with a description of its own keeps it.
+    Set-ItemProperty -LiteralPath $keys.Scheme -Name '(default)' -Value 'Claude link'
+    Register-SignInRouter
+    $null = Unregister-SignInRouter
+    Assert ((Get-RegistryDefault $keys.Scheme) -eq 'Claude link') 'Pre-existing description not restored'
 
     # Without a backup, only our command goes; the key is kept rather than guessed about.
     Register-SignInRouter

@@ -1089,15 +1089,21 @@ function Register-SignInRouter {
     $keys = Get-RouterRegistryPath
     $cmd  = Get-RouterCommand
     # Whatever Claude registered is saved once, before the first change, so -Revert can
-    # put it back exactly. A command of ours is never saved as the original. Whether the
-    # claude key existed is saved too: the Store build can leave a bare one with no
-    # command, which has to survive a revert.
+    # put it back exactly. A command of ours is never saved as the original. The claude
+    # key itself is saved too, with the two values registration sets (null when absent):
+    # the Store build can leave a bare key behind, with no command and only some of them.
     if (-not (Test-Path -LiteralPath $script:HandlerBackupPath)) {
         $existing = Get-RegistryDefault $keys.SchemeCommand
         if ($existing -notlike '* -HandleLink *') {
+            $values = Get-ItemProperty -LiteralPath $keys.Scheme -ErrorAction SilentlyContinue
+            $names  = @(if ($values) { $values.PSObject.Properties.Name })
             New-Item -ItemType Directory -Force -Path (Split-Path $script:HandlerBackupPath -Parent) | Out-Null
-            @{ Command = $existing; KeyExisted = (Test-Path -LiteralPath $keys.Scheme) } |
-                ConvertTo-Json | Set-Content -LiteralPath $script:HandlerBackupPath -Encoding UTF8
+            @{
+                Command     = $existing
+                KeyExisted  = (Test-Path -LiteralPath $keys.Scheme)
+                Description = $(if ($names -contains '(default)') { [string]$values.'(default)' } else { $null })
+                UrlProtocol = $(if ($names -contains 'URL Protocol') { [string]$values.'URL Protocol' } else { $null })
+            } | ConvertTo-Json | Set-Content -LiteralPath $script:HandlerBackupPath -Encoding UTF8
         }
     }
     Set-RegistryValue $keys.Scheme '(default)' "URL:$($script:LinkScheme)"
@@ -1166,6 +1172,15 @@ function Unregister-SignInRouter {
             }
         }
         $done.Add('removed our claude:// handler; Claude registers its own the next time it starts')
+    }
+    # A key that was there before gets its own two values back, including their absence.
+    if ($backup -and $backup.KeyExisted -and (Test-Path -LiteralPath $keys.Scheme)) {
+        foreach ($pair in @(@('(default)', 'Description'), @('URL Protocol', 'UrlProtocol'))) {
+            if ($backup.PSObject.Properties.Name -notcontains $pair[1]) { continue }   # a backup from before this was saved
+            $value = $backup.($pair[1])
+            if ($null -eq $value) { Remove-ItemProperty -LiteralPath $keys.Scheme -Name $pair[0] -ErrorAction SilentlyContinue }
+            else { Set-ItemProperty -LiteralPath $keys.Scheme -Name $pair[0] -Value $value }
+        }
     }
     if (Test-Path -LiteralPath $script:HandlerBackupPath) { Remove-Item -LiteralPath $script:HandlerBackupPath -Force }
 
