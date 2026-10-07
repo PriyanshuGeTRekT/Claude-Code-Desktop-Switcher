@@ -1264,7 +1264,9 @@ function Show-RouterPickHint {
 }
 
 function Invoke-SignInRouter {
-    param([Parameter(Mandatory)][string]$Link)
+    # Not Mandatory: an empty link must reach Test-SafeLink and be refused quietly, not
+    # stop at parameter binding with an error dialog.
+    param([string]$Link)
     if (-not (Test-SafeLink -Link $Link)) {
         # Refused rather than passed on: a link that fails is malformed or an attempt to
         # smuggle extra arguments. Never logged, because a sign-in link carries a code.
