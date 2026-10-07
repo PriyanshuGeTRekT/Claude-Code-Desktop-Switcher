@@ -136,8 +136,8 @@ flowchart LR
     S -->|--user-data-dir| W["Claude<br/>Work"]
     S -->|--user-data-dir| P["Claude<br/>Personal"]
     D --- DD[("Claude's own data<br/>never touched")]
-    W --- WD[("ClaudeProfiles\Work")]
-    P --- PD[("ClaudeProfiles\Personal")]
+    W --- WD[("ClaudeProfile-Work")]
+    P --- PD[("ClaudeProfile-Personal")]
 ```
 
 Claude ships in two shapes on Windows, and the switcher detects whichever you have:
@@ -153,7 +153,14 @@ Claude ships in two shapes on Windows, and the switcher detects whichever you ha
 - **`Default` is never touched.** On the Store build it is started through the shell app model
   rather than by running the `.exe`, so it keeps full package identity: `claude://` links, the
   native messaging host and auto update behave exactly as before. Profiles this tool creates
-  live in `%LOCALAPPDATA%\ClaudeProfiles`, nowhere near Claude's own data.
+  live in `%LOCALAPPDATA%\ClaudeProfile-<name>`, nowhere near Claude's own data.
+- **Profile folders sit directly under `%LOCALAPPDATA%`** because Cowork needs it. When a
+  Cowork task runs locally, its Windows service is told only the profile folder's name and
+  looks for the Linux VM image in `%LOCALAPPDATA%\<name>`, refusing junctions, so in a nested
+  folder the VM never starts. Earlier versions kept profiles in
+  `%LOCALAPPDATA%\ClaudeProfiles\<name>`; each one moves to its new place the next time the
+  switcher starts. A profile that is open at that moment stays where it is, is still used
+  from there, and moves on a later start.
 - **Install paths contain the version number**, so they change with every update. Shortcuts
   resolve the executable when clicked and carry their own icon files, so they keep working
   and keep their icons after Claude updates itself.

@@ -41,6 +41,14 @@ jobs:
         shell: pwsh
         run: .\tests\ChatTransfer.Tests.ps1
 
+      - name: Profile layout tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\ProfileLayout.Tests.ps1
+
+      - name: Profile layout tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\ProfileLayout.Tests.ps1
+
       - name: Install PSScriptAnalyzer
         shell: pwsh
         run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
