@@ -56,16 +56,26 @@ try {
     Remove-Item -LiteralPath (& $new 'Taken') -Force
 
     # The one-time move.
-    New-Item -ItemType Directory -Path (& $old 'Running'), (& $old 'Blocked'), (& $old 'Personal') -Force | Out-Null
-    foreach ($id in 'Running', 'Blocked', 'Personal') { [IO.File]::WriteAllText((Join-Path (& $old $id) 'config.json'), "{""id"":""$id""}") }
+    New-Item -ItemType Directory -Path (& $old 'Running'), (& $old 'Blocked'), (& $old 'Personal'), (& $old 'Stranded') -Force | Out-Null
+    foreach ($id in 'Running', 'Blocked', 'Personal', 'Stranded') { [IO.File]::WriteAllText((Join-Path (& $old $id) 'config.json'), "{""id"":""$id""}") }
     New-Item -ItemType Directory -Path (& $new 'Blocked') -Force | Out-Null
     [IO.File]::WriteAllText((Join-Path (& $new 'Blocked') 'keep.txt'), 'someone else''s data')
     $redirectedOld = Join-Path $cache 'Local\ClaudeProfiles\Personal\claude-code-sessions'
     New-Item -ItemType Directory -Path $redirectedOld -Force | Out-Null
+    # Store-redirected files under both names: neither side is overwritten, and it is logged.
+    New-Item -ItemType Directory -Path (Join-Path $cache 'Local\ClaudeProfiles\Stranded\claude-code-sessions'), (Join-Path $cache 'Local\ClaudeProfile-Stranded') -Force | Out-Null
     $script:Running = @{ (& $old 'Running') = 42 }
+    $script:LogPath = Join-Path $fixture 'switcher-error.log'
     Move-LegacyProfileFolder
+    $logged = Get-Content -LiteralPath $script:LogPath -Raw -ErrorAction SilentlyContinue
+    Assert ($logged -match "Left profile 'Blocked'.*already holds files") 'Skipped move not logged'
+    Assert ($logged -notmatch "'Running'") 'Open profile logged as a failure'
     Assert ((Test-Path (Join-Path (& $new 'Personal') 'config.json')) -and -not (Test-Path (& $old 'Personal'))) 'Profile not moved'
     Assert (Test-Path (Join-Path $cache 'Local\ClaudeProfile-Personal\claude-code-sessions')) 'Store-redirected files not moved along'
+    Assert ($logged -notmatch "'Personal'") 'Successful move logged'
+    Assert (Test-Path (Join-Path (& $new 'Stranded') 'config.json')) 'Profile not moved when its Store-redirected part could not be'
+    Assert (Test-Path (Join-Path $cache 'Local\ClaudeProfiles\Stranded\claude-code-sessions')) 'Store-redirected files overwritten or lost'
+    Assert ($logged -match "Left part of profile 'Stranded'.*already exists") 'Store-redirected part left behind without a log line'
     Assert (Test-Path (Join-Path (& $old 'Running') 'config.json')) 'Running profile moved'
     Assert ((Test-Path (Join-Path (& $old 'Blocked') 'config.json')) -and (Test-Path (Join-Path (& $new 'Blocked') 'keep.txt'))) 'Non-empty target overwritten'
     Assert ((Test-Path (Join-Path (& $new 'Busy') 'config.json')) -and -not (Test-Path (& $old 'Busy'))) 'Empty leftover target not replaced'
@@ -75,7 +85,7 @@ try {
     Move-LegacyProfileFolder
     Assert ((Test-Path (Join-Path (& $new 'Running') 'config.json')) -and -not (Test-Path (& $old 'Running'))) 'Profile not moved once it stopped'
 
-    Write-Output 'PASS: profiles directly under LOCALAPPDATA, old place still found, empty leftover ignored, listing, taken names, one-time move (running, non-empty and empty targets, Store redirect).'
+    Write-Output 'PASS: profiles directly under LOCALAPPDATA, old place still found, empty leftover ignored, listing, taken names, one-time move (running, non-empty and empty targets, Store redirect, skipped moves logged).'
 } finally {
     $env:LOCALAPPDATA = $originalLocal
     $resolved = [IO.Path]::GetFullPath($fixture)
