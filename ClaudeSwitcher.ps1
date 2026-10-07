@@ -1178,8 +1178,13 @@ function Unregister-SignInRouter {
         foreach ($pair in @(@('(default)', 'Description'), @('URL Protocol', 'UrlProtocol'))) {
             if ($backup.PSObject.Properties.Name -notcontains $pair[1]) { continue }   # a backup from before this was saved
             $value = $backup.($pair[1])
-            if ($null -eq $value) { Remove-ItemProperty -LiteralPath $keys.Scheme -Name $pair[0] -ErrorAction SilentlyContinue }
-            else { Set-ItemProperty -LiteralPath $keys.Scheme -Name $pair[0] -Value $value }
+            if ($null -ne $value) { Set-ItemProperty -LiteralPath $keys.Scheme -Name $pair[0] -Value $value; continue }
+            # Through .NET: Remove-ItemProperty cannot delete the default value, whose real
+            # name is empty; '(default)' is only how PowerShell displays it.
+            $sub = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(($keys.Scheme -replace '^HKCU:\\', ''), $true)
+            if ($sub) {
+                try { $sub.DeleteValue($(if ($pair[0] -eq '(default)') { '' } else { $pair[0] }), $false) } finally { $sub.Close() }
+            }
         }
     }
     if (Test-Path -LiteralPath $script:HandlerBackupPath) { Remove-Item -LiteralPath $script:HandlerBackupPath -Force }
