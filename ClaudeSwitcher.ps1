@@ -445,8 +445,9 @@ function Start-ClaudeProfile {
     # so it is there when the button is created. Cosmetic, so a failure is ignored.
     $startMenu = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'
     $target = Resolve-ClaudeProfile -Name $Id -SkipStatus
+    $script:ShortcutJustCreated = $false
     if ($target -and -not (Test-Path -LiteralPath (Join-Path $startMenu "Claude - $($target.Name).lnk"))) {
-        try { New-ProfileShortcut -Target $target -Directory $startMenu | Out-Null } catch { }
+        try { New-ProfileShortcut -Target $target -Directory $startMenu | Out-Null; $script:ShortcutJustCreated = $true } catch { }
     }
     # -WindowStyle Normal matters: shortcuts run us without a window, and without an
     # explicit show state Claude would inherit ours and start with an invisible window.
@@ -898,6 +899,9 @@ function New-IdentityWatch {
         ProcessId  = $(if ($Process) { $Process.Id } else { 0 })
         Until      = (Get-Date).AddSeconds($Seconds)
         NextLookup = [datetime]::MinValue
+        # Set when this launch created the Start menu shortcut: see Step-IdentityWatch.
+        Rebuild    = [bool]$script:ShortcutJustCreated
+        RebuildAt  = $null
     }
 }
 
@@ -915,7 +919,17 @@ function Step-IdentityWatch {
         $Watch.ProcessId  = [int]((Get-RunningProfileMap)[$Watch.Target.Path.TrimEnd('\')])
         if (-not $Watch.ProcessId) { return $false }
     }
-    return (Update-ProfileWindowIdentity -Target $Watch.Target -ProcessId $Watch.ProcessId)
+    $shown = Update-ProfileWindowIdentity -Target $Watch.Target -ProcessId $Watch.ProcessId
+    if (-not $shown -or -not $Watch.Rebuild) { return $shown }
+    # Windows indexes a new Start menu shortcut a few seconds after it is written, and a
+    # button created before that shows Claude's plain icon. Rebuilt once, a little later,
+    # it picks up the shortcut's badge.
+    if (-not $Watch.RebuildAt) { $Watch.RebuildAt = (Get-Date).AddSeconds(5); return $false }
+    if ((Get-Date) -lt $Watch.RebuildAt) { return $false }
+    foreach ($hwnd in [ClaudeSwitcher.TaskbarIdentity]::WindowsForPid([uint32]$Watch.ProcessId, $false)) {
+        try { [ClaudeSwitcher.TaskbarIdentity]::RebuildTaskbarButton($hwnd) } catch { }
+    }
+    return $true
 }
 
 # ---------------------------------------------------------------- shortcuts --
