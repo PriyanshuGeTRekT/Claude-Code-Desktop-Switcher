@@ -832,6 +832,9 @@ $script:IdentityIcons = @{}
 
 function Get-ProfileIconHandle {
     param([Parameter(Mandatory)]$Target)
+    # Loads System.Drawing, which Get-ProfileColor needs: -Launch reaches here before
+    # anything else in that process has loaded it.
+    Initialize-Native
     $letter = Get-BadgeLetter -Label $Target.Name
     $key = "$($Target.Id)|$letter"
     if (-not $script:IdentityIcons.ContainsKey($key)) {
