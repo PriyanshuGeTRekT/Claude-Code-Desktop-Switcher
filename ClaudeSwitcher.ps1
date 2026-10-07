@@ -1207,9 +1207,10 @@ function Enable-SignInRouting {
 function Disable-SignInRouting {
     Set-Setting 'SignInRouting' $false
     Clear-PendingSignIn
-    $done = Unregister-SignInRouter
     Write-RouterLog 'Sign-in routing turned off.'
-    return $done
+    # Passed straight through: capturing and returning nothing would hand callers a $null
+    # that @() counts as one item.
+    Unregister-SignInRouter
 }
 
 function Update-SignInRouting {

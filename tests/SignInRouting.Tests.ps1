@@ -6,10 +6,19 @@ if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
 foreach ($name in @('Get-Setting','Test-SignInRoutingOn','Test-SafeLink','Test-SignInLink','Get-ProfileDataPath','Test-ProfileSignedIn',
                     'Set-PendingSignIn','Get-PendingSignIn','Clear-PendingSignIn','Select-SignInTarget','Get-LauncherScript',
                     'Get-RouterCommand','Get-RegistryDefault','Set-RegistryValue','Get-RouterRegistryPath','Test-RouterRegistered',
-                    'Register-SignInRouter','Test-RouterChosen','Unregister-SignInRouter')) {
+                    'Register-SignInRouter','Test-RouterChosen','Unregister-SignInRouter','Set-Setting','Write-RouterLog',
+                    'Disable-SignInRouting')) {
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}, $true)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
+}
+# The names the router registers under, taken from the script so the test checks the real ones.
+foreach ($name in @('LinkScheme','RouterProgId','RouterAppName','RouterDisplayName')) {
+    $node = $ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and
+                       $n.Left.Extent.Text -eq "`$script:$name"}, $true)
+    if (-not $node) { throw "Missing setting: `$script:$name" }
+    Set-Variable -Scope Script -Name $name -Value $node.Right.Expression.Value
+    if (-not (Get-Variable -Scope Script -Name $name -ValueOnly)) { throw "Empty setting: `$script:$name" }
 }
 function Assert($condition, $message) { if (-not $condition) { throw $message } }
 # Stands in for the shell, which a test cannot steer: what Windows would open claude:// links with.
@@ -169,6 +178,13 @@ try {
     Register-SignInRouter
     $null = Unregister-SignInRouter
     Assert (-not (Test-Path -LiteralPath $keys.Scheme)) 'Handler key we created was left behind'
+
+    # Turning it off with nothing left to undo reports nothing, rather than one empty line.
+    $script:RouterLogPath = Join-Path $fixture 'sign-in-router.log'
+    $script:ProfileRoot   = $fixture
+    $done = @(Disable-SignInRouting)
+    Assert ($done.Count -eq 0) "Nothing to undo, yet $($done.Count) line(s) reported"
+    Assert (-not (Test-SignInRoutingOn)) 'Routing still on after turning it off'
 
     Write-Output 'PASS: link validation, sign-in shapes, target selection, signed-in detection, pending marker, setting, Store paths, router command, registry round trip, revert with and without a Default apps pick.'
 } finally {
