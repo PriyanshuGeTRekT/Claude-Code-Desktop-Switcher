@@ -26,7 +26,7 @@
 | **Concurrent accounts** | Every account runs in its own window. Open as many as you like at the same time. |
 | **One click to switch** | Launch a profile, or bring it to the front if it is already open. Also from the tray. |
 | **Move Claude Code chats** | Copy chats from one account to another and carry on where you left off. |
-| **Icons you can tell apart** | Each profile gets a coloured badge for its desktop and Start menu shortcuts. |
+| **Icons you can tell apart** | Each profile gets a coloured badge for its shortcuts and its own taskbar button. |
 | **Nothing to install** | One PowerShell script. No patching, no proxy, no credential juggling. |
 | **Your original stays put** | The account you already have is never touched and keeps auto update and `claude://` links. |
 
@@ -90,6 +90,10 @@ jump to any account (open ones are ticked), add an account, or turn on **Start w
 **Add shortcuts** puts a `Claude - <name>` shortcut on the desktop and in the Start menu, so
 you can search for an account or pin it and skip the switcher entirely. Each profile keeps its
 colour, and clicking a shortcut for an account that is already open simply brings it forward.
+
+Each extra account's window also gets its own taskbar button with the same badge, instead of
+piling onto Claude's. A pinned profile shortcut shares that button with the window it opens.
+`Default` keeps Claude's own button, so an existing pinned Claude icon still matches it.
 
 ### Moving Claude Code chats between accounts
 
@@ -157,6 +161,12 @@ Claude ships in two shapes on Windows, and the switcher detects whichever you ha
 - **Install paths contain the version number**, so they change with every update. Shortcuts
   resolve the executable when clicked and carry their own icon files, so they keep working
   and keep their icons after Claude updates itself.
+- **Taskbar buttons** are grouped by an identifier called the AppUserModelID, and every Claude
+  window carries the same one. The switcher gives each extra account's window an identifier
+  of its own, with the badged icon, in the moment between Claude creating the window and
+  showing it. Windows reads a button's icon once per identifier, so the badge letter is part
+  of it: a rename that changes the letter gives the window a new identifier and a new icon.
+  Nothing is written to the registry, and Claude drops the identifier when it restarts.
 - **Running detection** only counts the desktop app's own process. The Claude Code CLI is also
   called `claude.exe` and the desktop app starts one per Code session; those are ignored.
 - **Renaming** changes a label only. The folder name is a profile's permanent id, because
@@ -176,9 +186,10 @@ sessions, shortcut icons, every tray menu item, and <kbd>Ctrl</kbd>+<kbd>N</kbd>
 delete, single instance behaviour and chat transfer (on sample data) were exercised end to
 end against a stand-in `Claude.exe`.
 
-**Not yet verified:** the **installer build** (no such install was available) and **chat
-transfer between two real signed-in accounts**. If you can try either, `-List` is a harmless
-way to check detection, and there is an
+**Not yet verified:** the **installer build** (no such install was available), **chat
+transfer between two real signed-in accounts**, and **per-account taskbar buttons** in their
+current form. If you can try any of these, `-List` is a harmless way to check detection, and
+there is an
 [issue template](.github/ISSUE_TEMPLATE/installer_build_report.yml) for reporting back. That
 is the most useful contribution anyone can make right now.
 
@@ -208,9 +219,10 @@ outside the switcher, its old shortcut will report that the profile no longer ex
 <details>
 <summary><b>Known limitations</b></summary>
 
-- Every instance shares Claude's taskbar identity, so open accounts group under one taskbar
-  button with the same icon. Hover to see each window.
-- A pinned profile shortcut shows up as a separate taskbar button from the window it opens.
+- Renaming a profile so that its badge letter changes gives its window a new taskbar
+  identity. A copy of its shortcut pinned before the rename stops matching the window until
+  you unpin it and pin the renamed shortcut. Desktop and Start menu shortcuts are updated
+  automatically; pinned ones cannot be.
 - `claude://` links always open in the `Default` account.
 - Each running account is a full copy of the app, so budget roughly one Claude's worth of
   memory per account. A profile grows to a few hundred MB, mostly caches.

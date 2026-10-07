@@ -442,7 +442,8 @@ function Start-ClaudeProfile {
     }
     # -WindowStyle Normal matters: shortcuts run us without a window, and without an
     # explicit show state Claude would inherit ours and start with an invisible window.
-    Start-Process -FilePath $script:ClaudeExe -ArgumentList "--user-data-dir=`"$path`"" -WindowStyle Normal
+    # The process is kept so its window can be given the profile's taskbar identity.
+    $script:LaunchedProcess = Start-Process -FilePath $script:ClaudeExe -ArgumentList "--user-data-dir=`"$path`"" -WindowStyle Normal -PassThru
     return $(if ($open) { 'focused' } else { 'started' })
 }
 
@@ -576,6 +577,336 @@ function Get-ProfileIconPath {
     return $file
 }
 
+# --------------------------------------------------------- taskbar identity --
+
+<#
+    Windows groups taskbar buttons by an AppUserModelID, and every Claude window carries the
+    same one, so all accounts pile onto one button with one icon. Each extra profile's
+    window is given an identity of its own, together with its badged icon, so it gets its
+    own button. Default is never touched: it keeps Claude's identity, so a pinned Claude
+    icon still matches it.
+
+    The identity is read when the taskbar button is created, so it is best set in the
+    moment between Electron creating the window and showing it. A window that is already
+    showing has its button rebuilt instead.
+
+    Windows reads a group's icon once per identity and never again. The badge letter is
+    therefore part of the identity: a rename that changes the letter moves the window to a
+    new identity, which brings the new icon with it. A profile's colour never changes.
+
+    Original idea and window identity code by Sukarth (Sukarth/Claude-Code-Desktop-Switcher).
+#>
+
+$script:TaskbarIdentitySource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace ClaudeSwitcher
+{
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    public struct PropertyKey
+    {
+        public Guid FormatId; public uint PropertyId;
+        public PropertyKey(Guid formatId, uint propertyId) { FormatId = formatId; PropertyId = propertyId; }
+    }
+
+    [ComImport, Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPropertyStore
+    {
+        int GetCount(out uint count);
+        int GetAt(uint index, out PropertyKey key);
+        int GetValue(ref PropertyKey key, IntPtr value);
+        int SetValue(ref PropertyKey key, IntPtr value);
+        int Commit();
+    }
+
+    [ComImport, Guid("0000010b-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPersistFile
+    {
+        int GetClassID(out Guid classId);
+        int IsDirty();
+        int Load([MarshalAs(UnmanagedType.LPWStr)] string fileName, uint mode);
+        int Save([MarshalAs(UnmanagedType.LPWStr)] string fileName, bool remember);
+        int SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string fileName);
+        int GetCurFile(out IntPtr fileName);
+    }
+
+    [ComImport, Guid("56FDF342-FD6D-11d0-958A-006097C9A090"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface ITaskbarList
+    {
+        int HrInit(); int AddTab(IntPtr hwnd); int DeleteTab(IntPtr hwnd);
+        int ActivateTab(IntPtr hwnd); int SetActiveAlt(IntPtr hwnd);
+    }
+
+    [ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090")] public class TaskbarListClass { }
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")] public class ShellLinkClass { }
+
+    public static class TaskbarIdentity
+    {
+        static readonly Guid AppUserModel = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
+        const uint PidRelaunchCommand = 2, PidRelaunchIcon = 3, PidRelaunchName = 4, PidId = 5;
+        const short VT_LPWSTR = 31;
+        const uint WM_SETICON = 0x0080, WM_GETICON = 0x007F, GW_OWNER = 4;
+        const int GWL_EXSTYLE = -20;
+        const long WS_EX_TOOLWINDOW = 0x80L;
+
+        delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int size);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")] static extern IntPtr GetWindowLongPtr64(IntPtr hwnd, int index);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLong")] static extern int GetWindowLong32(IntPtr hwnd, int index);
+        [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("shell32.dll", PreserveSig = false)]
+        static extern void SHGetPropertyStoreForWindow(IntPtr hwnd, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out IPropertyStore store);
+        [DllImport("ole32.dll")] static extern int PropVariantClear(IntPtr value);
+
+        static long ExStyle(IntPtr hwnd)
+        {
+            return IntPtr.Size == 8 ? GetWindowLongPtr64(hwnd, GWL_EXSTYLE).ToInt64() : (long)GetWindowLong32(hwnd, GWL_EXSTYLE);
+        }
+
+        static string ClassOf(IntPtr hwnd)
+        {
+            var name = new StringBuilder(64); GetClassName(hwnd, name, name.Capacity); return name.ToString();
+        }
+
+        /// Top-level Electron windows of a process that can have a taskbar button. Hidden
+        /// ones are included on request: that is the moment to set an identity.
+        public static IntPtr[] WindowsForPid(uint pid, bool includeHidden)
+        {
+            var found = new List<IntPtr>();
+            EnumWindows(delegate(IntPtr hwnd, IntPtr lParam)
+            {
+                uint owner; GetWindowThreadProcessId(hwnd, out owner);
+                if (owner != pid) return true;
+                if (!includeHidden && !IsWindowVisible(hwnd)) return true;
+                if (GetWindow(hwnd, GW_OWNER) != IntPtr.Zero) return true;
+                if ((ExStyle(hwnd) & WS_EX_TOOLWINDOW) != 0) return true;
+                if (ClassOf(hwnd) != "Chrome_WidgetWin_1") return true;
+                found.Add(hwnd);
+                return true;
+            }, IntPtr.Zero);
+            return found.ToArray();
+        }
+
+        public static bool IsVisible(IntPtr hwnd) { return IsWindowVisible(hwnd); }
+
+        // A PROPVARIANT built by hand, because InitPropVariantFromString is an inline SDK
+        // helper rather than an export: vt at offset 0, the string pointer at offset 8.
+        static void SetString(IPropertyStore store, uint propertyId, string value)
+        {
+            var key = new PropertyKey(AppUserModel, propertyId);
+            IntPtr pv = Marshal.AllocCoTaskMem(32);
+            for (int i = 0; i < 32; i++) Marshal.WriteByte(pv, i, 0);
+            try
+            {
+                Marshal.WriteInt16(pv, 0, VT_LPWSTR);
+                Marshal.WriteIntPtr(pv, 8, Marshal.StringToCoTaskMemUni(value));   // freed by PropVariantClear
+                Marshal.ThrowExceptionForHR(store.SetValue(ref key, pv));
+            }
+            finally { PropVariantClear(pv); Marshal.FreeCoTaskMem(pv); }
+        }
+
+        static string GetString(IPropertyStore store, uint propertyId)
+        {
+            var key = new PropertyKey(AppUserModel, propertyId);
+            IntPtr pv = Marshal.AllocCoTaskMem(32);
+            for (int i = 0; i < 32; i++) Marshal.WriteByte(pv, i, 0);
+            try
+            {
+                if (store.GetValue(ref key, pv) != 0) return null;
+                if (Marshal.ReadInt16(pv, 0) != VT_LPWSTR) return null;
+                return Marshal.PtrToStringUni(Marshal.ReadIntPtr(pv, 8));
+            }
+            finally { PropVariantClear(pv); Marshal.FreeCoTaskMem(pv); }
+        }
+
+        public static void SetWindowIdentity(IntPtr hwnd, string id, string relaunchCommand, string displayName, string iconResource)
+        {
+            Guid iid = typeof(IPropertyStore).GUID; IPropertyStore store;
+            SHGetPropertyStoreForWindow(hwnd, ref iid, out store);
+            try
+            {
+                SetString(store, PidId, id);
+                SetString(store, PidRelaunchCommand, relaunchCommand);
+                SetString(store, PidRelaunchName, displayName);
+                SetString(store, PidRelaunchIcon, iconResource);
+                Marshal.ThrowExceptionForHR(store.Commit());
+            }
+            finally { Marshal.ReleaseComObject(store); }
+        }
+
+        public static string GetWindowIdentity(IntPtr hwnd)
+        {
+            Guid iid = typeof(IPropertyStore).GUID; IPropertyStore store;
+            SHGetPropertyStoreForWindow(hwnd, ref iid, out store);
+            try { return GetString(store, PidId); }
+            finally { Marshal.ReleaseComObject(store); }
+        }
+
+        /// The identity of a .lnk, so a pinned copy of it shares a button with its window.
+        public static void SetShortcutIdentity(string path, string id)
+        {
+            object link = new ShellLinkClass();
+            try
+            {
+                var file = (IPersistFile)link;
+                Marshal.ThrowExceptionForHR(file.Load(path, 0x00000002));   // STGM_READWRITE
+                var store = (IPropertyStore)link;
+                SetString(store, PidId, id);
+                Marshal.ThrowExceptionForHR(store.Commit());
+                Marshal.ThrowExceptionForHR(file.Save(path, true));
+            }
+            finally { Marshal.ReleaseComObject(link); }
+        }
+
+        public static string GetShortcutIdentity(string path)
+        {
+            object link = new ShellLinkClass();
+            try
+            {
+                Marshal.ThrowExceptionForHR(((IPersistFile)link).Load(path, 0));   // STGM_READ
+                return GetString((IPropertyStore)link, PidId);
+            }
+            finally { Marshal.ReleaseComObject(link); }
+        }
+
+        /// Only for a visible window: AddTab on a hidden one would leave a phantom button.
+        public static void RebuildTaskbarButton(IntPtr hwnd)
+        {
+            var taskbar = (ITaskbarList)new TaskbarListClass();
+            try { taskbar.HrInit(); taskbar.DeleteTab(hwnd); taskbar.AddTab(hwnd); }
+            finally { Marshal.ReleaseComObject(taskbar); }
+        }
+
+        public static IntPtr GetIcon(IntPtr hwnd) { return SendMessage(hwnd, WM_GETICON, (IntPtr)1, IntPtr.Zero); }
+
+        public static void SetIcon(IntPtr hwnd, IntPtr icon)
+        {
+            SendMessage(hwnd, WM_SETICON, (IntPtr)0, icon);
+            SendMessage(hwnd, WM_SETICON, (IntPtr)1, icon);
+        }
+    }
+}
+'@
+
+# Compiled in memory, only on the paths that tag a window or a shortcut.
+function Initialize-TaskbarIdentity {
+    if ('ClaudeSwitcher.TaskbarIdentity' -as [type]) { return }
+    Add-Type -TypeDefinition $script:TaskbarIdentitySource
+}
+
+function Get-ProfileAumid {
+    # Unique per profile (the readable part loses spaces and symbols, the hash does not) and
+    # per badge letter. Letters only, digits and dots, well under the 128 character limit.
+    param([Parameter(Mandatory)]$Target)
+    $readable = ($Target.Id -replace '[^A-Za-z0-9]', '')
+    if ($readable.Length -gt 32) { $readable = $readable.Substring(0, 32) }
+    $sha  = [System.Security.Cryptography.SHA256]::Create()
+    $hash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Target.Id))).Replace('-', '').Substring(0, 10)
+    $sha.Dispose()
+    $letter = [int][char](Get-BadgeLetter -Label $Target.Name)
+    return 'ClaudeProfileSwitcher.Profile{0}.h{1}.b{2:x4}' -f $readable, $hash, $letter
+}
+
+function Get-ProfileRelaunchCommand {
+    # What a pinned taskbar button runs: the same launcher as the profile's shortcuts.
+    param([Parameter(Mandatory)]$Target)
+    $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+    $cmd     = "-NoProfile -ExecutionPolicy Bypass -File `"$(Get-LauncherScript)`" -Launch `"$($Target.Id)`""
+    if ([Environment]::OSVersion.Version.Build -ge 17763 -and (Test-Path -LiteralPath $conhost)) {
+        return "`"$conhost`" --headless `"$ps`" $cmd"
+    }
+    return "`"$ps`" -WindowStyle Hidden $cmd"
+}
+
+# Icon handles live as long as this process: a window draws with the handle it was given,
+# so it must not be freed while any window may still use it. One per profile and letter.
+$script:IdentityIcons = @{}
+
+function Get-ProfileIconHandle {
+    param([Parameter(Mandatory)]$Target)
+    $letter = Get-BadgeLetter -Label $Target.Name
+    $key = "$($Target.Id)|$letter"
+    if (-not $script:IdentityIcons.ContainsKey($key)) {
+        # 256 px: Windows 11 applies a smaller WM_SETICON icon to the window frame only
+        # and leaves the taskbar button as it was.
+        $bmp = New-BadgedBitmap -Size 256 -Letter $letter -Color (Get-ProfileColor -Id $Target.Id)
+        $script:IdentityIcons[$key] = $bmp.GetHicon()
+        $bmp.Dispose()
+    }
+    return $script:IdentityIcons[$key]
+}
+
+# Tags every window of one profile's process that lacks the profile's identity or icon.
+# Returns whether a visible window carries the identity now.
+function Update-ProfileWindowIdentity {
+    param([Parameter(Mandatory)]$Target, [Parameter(Mandatory)][int]$ProcessId)
+    if ($Target.IsDefault) { return $true }
+    Initialize-TaskbarIdentity
+    $want  = Get-ProfileAumid -Target $Target
+    $icon  = Get-ProfileIconHandle -Target $Target
+    $shown = $false
+    foreach ($hwnd in [ClaudeSwitcher.TaskbarIdentity]::WindowsForPid([uint32]$ProcessId, $true)) {
+        try {
+            if ([ClaudeSwitcher.TaskbarIdentity]::GetWindowIdentity($hwnd) -ne $want) {
+                [ClaudeSwitcher.TaskbarIdentity]::SetWindowIdentity($hwnd, $want, (Get-ProfileRelaunchCommand -Target $Target),
+                    "Claude - $($Target.Name)", "$(Get-ProfileIconPath -Target $Target),0")
+                [ClaudeSwitcher.TaskbarIdentity]::SetIcon($hwnd, $icon)
+                if ([ClaudeSwitcher.TaskbarIdentity]::IsVisible($hwnd)) { [ClaudeSwitcher.TaskbarIdentity]::RebuildTaskbarButton($hwnd) }
+            } elseif ([ClaudeSwitcher.TaskbarIdentity]::GetIcon($hwnd) -ne $icon) {
+                # Tagged by a shortcut's -Launch, which has exited since, and its icon handle
+                # with it. This process outlives that one, so it supplies the icon from now on.
+                [ClaudeSwitcher.TaskbarIdentity]::SetIcon($hwnd, $icon)
+            }
+            if ([ClaudeSwitcher.TaskbarIdentity]::IsVisible($hwnd)) { $shown = $true }
+        } catch { }
+    }
+    return $shown
+}
+
+function Update-RunningProfileIdentity {
+    foreach ($p in @(Get-ProfileList | Where-Object { $_.Pid -and -not $_.IsDefault })) {
+        try { Update-ProfileWindowIdentity -Target $p -ProcessId $p.Pid | Out-Null } catch { }
+    }
+}
+
+# Watches one launch for the window Claude is about to show. Polled every 150 ms by the
+# caller, so the window is usually tagged before its taskbar button exists.
+function New-IdentityWatch {
+    param([Parameter(Mandatory)]$Target, $Process, [int]$Seconds = 25)
+    return [pscustomobject]@{
+        Target     = $Target
+        Process    = $Process
+        ProcessId  = $(if ($Process) { $Process.Id } else { 0 })
+        Until      = (Get-Date).AddSeconds($Seconds)
+        NextLookup = [datetime]::MinValue
+    }
+}
+
+# One poll. Returns $true when the watch is over: the window is tagged and showing, or
+# time ran out.
+function Step-IdentityWatch {
+    param([Parameter(Mandatory)]$Watch)
+    if ((Get-Date) -gt $Watch.Until) { return $true }
+    if ($Watch.Process -and $Watch.Process.HasExited) { $Watch.Process = $null; $Watch.ProcessId = 0 }
+    if (-not $Watch.ProcessId) {
+        # Handed to a copy that was already running, or started through a stub. Found by
+        # its profile folder instead, at most once a second since that asks WMI.
+        if ((Get-Date) -lt $Watch.NextLookup) { return $false }
+        $Watch.NextLookup = (Get-Date).AddSeconds(1)
+        $Watch.ProcessId  = [int]((Get-RunningProfileMap)[$Watch.Target.Path.TrimEnd('\')])
+        if (-not $Watch.ProcessId) { return $false }
+    }
+    return (Update-ProfileWindowIdentity -Target $Watch.Target -ProcessId $Watch.ProcessId)
+}
+
 # ---------------------------------------------------------------- shortcuts --
 
 function Get-ShortcutDirs {
@@ -634,6 +965,14 @@ function New-ProfileShortcut {
     $link.WorkingDirectory = $script:SwitcherHome
     New-Item -ItemType Directory -Force -Path $script:SwitcherHome | Out-Null
     $link.Save()
+    if (-not $Target.IsDefault) {
+        # The window's identity, so a pinned copy of this shortcut shares its button
+        # instead of sitting beside it. Cosmetic, so a failure leaves a plain shortcut.
+        try {
+            Initialize-TaskbarIdentity
+            [ClaudeSwitcher.TaskbarIdentity]::SetShortcutIdentity($link.FullName, (Get-ProfileAumid -Target $Target))
+        } catch { }
+    }
     return $link.FullName
 }
 
@@ -850,6 +1189,10 @@ if ($Install) {
 if ($AddAccount) {
     $created = Add-ClaudeAccount
     "Added '$($created.Name)'. Sign in with the other account in the Claude window that just opened."
+    try {
+        $watch = New-IdentityWatch -Target $created -Process $script:LaunchedProcess
+        while (-not (Step-IdentityWatch -Watch $watch)) { Start-Sleep -Milliseconds 150 }
+    } catch { }
     return
 }
 
@@ -860,7 +1203,13 @@ if ($Launch) {
         $known = (Get-ProfileList -SkipStatus | ForEach-Object { $_.Name }) -join ', '
         throw "There is no Claude profile called '$Launch'.`r`n`r`nProfiles: $known"
     }
-    Start-ClaudeProfile -Id $target.Id | Out-Null
+    $how = Start-ClaudeProfile -Id $target.Id
+    if ($how -eq 'started' -and -not $target.IsDefault) {
+        try {
+            $watch = New-IdentityWatch -Target $target -Process $script:LaunchedProcess
+            while (-not (Step-IdentityWatch -Watch $watch)) { Start-Sleep -Milliseconds 150 }
+        } catch { }
+    }
     return
 }
 
@@ -1190,11 +1539,21 @@ function Invoke-LaunchProfile {
     param([Parameter(Mandatory)]$Target)
     try {
         $how = Start-ClaudeProfile -Id $Target.Id
+        if ($how -eq 'started') { Add-IdentityWatch -Target $Target }
         # The refresh timer flips the row to Running once the window is up.
         $status.Text = $(if ($how -eq 'focused') { "Switched to '$($Target.Name)'." } else { "Starting '$($Target.Name)'..." })
     } catch {
         Show-Message $_.Exception.Message 'Could not launch' 'OK' 'Error' | Out-Null
     }
+}
+
+$script:IdentityWatches = New-Object System.Collections.Generic.List[object]
+
+function Add-IdentityWatch {
+    param([Parameter(Mandatory)]$Target)
+    if ($Target.IsDefault) { return }
+    $script:IdentityWatches.Add((New-IdentityWatch -Target $Target -Process $script:LaunchedProcess))
+    $watchTimer.Start()
 }
 
 function Invoke-AddAccount {
@@ -1204,6 +1563,7 @@ function Invoke-AddAccount {
         Show-Message $_.Exception.Message 'Could not add an account' 'OK' 'Error' | Out-Null
         return
     }
+    Add-IdentityWatch -Target $created
     $script:JustAdded = $created.Id
     Update-List -Force
     Select-ProfileRow -Id $created.Id
@@ -1218,6 +1578,8 @@ function Invoke-RenameProfile {
     if (-not $answer -or -not $answer.Text -or $answer.Text -ceq $p.Name) { return }
     try {
         $renamed = Rename-ClaudeProfile -Target $p -NewName $answer.Text
+        # A new badge letter is a new identity and icon; an open window moves to it now.
+        try { Update-RunningProfileIdentity } catch { }
         Update-List -Force
         Select-ProfileRow -Id $renamed.Id
         $status.Text = "Renamed '$($p.Name)' to '$($renamed.Name)'."
@@ -1532,6 +1894,33 @@ $signalTimer = New-Object System.Windows.Forms.Timer
 $signalTimer.Interval = 250
 $signalTimer.Add_Tick({ if ($script:ShowSignal.WaitOne(0)) { Show-Switcher } })
 $signalTimer.Start()
+
+# Fast, for about 25 s after the switcher launches a profile, so the window is tagged
+# before it is shown and its taskbar button is created with the right identity.
+$watchTimer = New-Object System.Windows.Forms.Timer
+$watchTimer.Interval = 150
+$watchTimer.Add_Tick({
+    for ($i = $script:IdentityWatches.Count - 1; $i -ge 0; $i--) {
+        $finished = $true
+        try { $finished = Step-IdentityWatch -Watch $script:IdentityWatches[$i] } catch { }
+        if ($finished) { $script:IdentityWatches.RemoveAt($i) }
+    }
+    if ($script:IdentityWatches.Count -eq 0) { $watchTimer.Stop() }
+})
+
+# Slow, for profiles started some other way: a shortcut, or Claude restarting itself.
+# A full pass asks WMI, so it only runs while the set of Claude processes has changed in
+# the last 30 s. The first tick always counts as a change, which tags what is already open.
+$script:ClaudeProcessSet  = $null
+$script:IdentityPassUntil = [datetime]::MinValue
+$identityTimer = New-Object System.Windows.Forms.Timer
+$identityTimer.Interval = 4000
+$identityTimer.Add_Tick({
+    $now = (@(Get-Process -Name Claude -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }) | Sort-Object) -join ','
+    if ($now -ne $script:ClaudeProcessSet) { $script:ClaudeProcessSet = $now; $script:IdentityPassUntil = (Get-Date).AddSeconds(30) }
+    if ((Get-Date) -lt $script:IdentityPassUntil) { try { Update-RunningProfileIdentity } catch { } }
+})
+$identityTimer.Start()
 
 $script:ExitRequested = $false
 $notify.Visible = $true
