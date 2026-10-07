@@ -93,6 +93,8 @@ trap {
 # Everything we create lives here, well clear of anything Claude owns. The switcher's
 # own files sit in a dot-folder so they can never be mistaken for a profile.
 $script:ProfileRoot     = Join-Path $env:LOCALAPPDATA 'ClaudeProfiles'
+# Extra profiles' data lives directly under %LOCALAPPDATA%, never nested: see Get-ProfilePath.
+$script:ProfileDirPrefix = 'ClaudeProfile-'
 $script:SwitcherHome    = Join-Path $script:ProfileRoot '.switcher'
 $script:IconDir         = Join-Path $script:SwitcherHome 'icons'
 $script:InstalledScript = Join-Path $script:SwitcherHome 'ClaudeSwitcher.ps1'
@@ -255,7 +257,16 @@ public static extern uint PrivateExtractIcons(string file, int index, int cx, in
 function Get-ProfilePath {
     param([Parameter(Mandatory)][string]$Id)
     if ($Id -eq $script:DefaultName) { return $script:DefaultProfilePath }
-    return (Join-Path $script:ProfileRoot $Id)
+    # Directly under %LOCALAPPDATA%: Cowork's VM service is told only the data folder's
+    # name and looks for its Linux image in %LOCALAPPDATA%\<name>, so in a nested folder
+    # the VM never starts ("VHDX file not found"). A junction there is refused.
+    $path   = Join-Path $env:LOCALAPPDATA ($script:ProfileDirPrefix + $Id)
+    $legacy = Join-Path $script:ProfileRoot $Id
+    # Not moved yet (it was running, see Move-LegacyProfileFolder): keep using the old
+    # folder rather than start an empty profile. Also when only an empty leftover sits
+    # at the new place, which a half-finished manual move can leave behind.
+    if ((Test-Path -LiteralPath $legacy) -and -not (Test-Path -LiteralPath (Join-Path $path 'config.json'))) { return $legacy }
+    return $path
 }
 
 # Matches the desktop app's own executable, whichever version of it is running.
@@ -334,11 +345,14 @@ function Get-ProfileList {
 
     $ids = New-Object System.Collections.Generic.List[string]
     $ids.Add($script:DefaultName)
+    $found = @(Get-ChildItem -LiteralPath $env:LOCALAPPDATA -Directory -Filter "$($script:ProfileDirPrefix)*" -ErrorAction SilentlyContinue |
+               ForEach-Object { $_.Name.Substring($script:ProfileDirPrefix.Length) })
+    # Plus any still in the old place, because they were running when the move was tried.
     if (Test-Path -LiteralPath $script:ProfileRoot) {
-        Get-ChildItem -LiteralPath $script:ProfileRoot -Directory -ErrorAction SilentlyContinue |
-            Where-Object { -not $_.Name.StartsWith('.') } | Sort-Object Name |
-            ForEach-Object { $ids.Add($_.Name) }
+        $found += @(Get-ChildItem -LiteralPath $script:ProfileRoot -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { -not $_.Name.StartsWith('.') } | ForEach-Object { $_.Name })
     }
+    $found | Where-Object { $_ -and $_ -ne $script:DefaultName } | Sort-Object -Unique | ForEach-Object { $ids.Add($_) }
 
     foreach ($id in $ids) {
         $path = Get-ProfilePath -Id $id
@@ -375,15 +389,17 @@ function Test-ProfileName {
         if ($p.Id -eq $ExceptId) { continue }
         if ($p.Id -eq $Name -or $p.Name -eq $Name)        { return "A profile named '$Name' already exists." }
     }
-    if (-not $ExceptId -and (Test-Path -LiteralPath (Join-Path $script:ProfileRoot $Name))) {
-        return "'$Name' is already taken by a file in $($script:ProfileRoot)."
+    if (-not $ExceptId) {
+        foreach ($taken in (Join-Path $env:LOCALAPPDATA ($script:ProfileDirPrefix + $Name)), (Join-Path $script:ProfileRoot $Name)) {
+            if (Test-Path -LiteralPath $taken) { return "'$Name' is already taken by $taken." }
+        }
     }
     return $null
 }
 
 function New-ClaudeProfile {
     param([Parameter(Mandatory)][string]$Name)
-    $path = Join-Path $script:ProfileRoot $Name
+    $path = Get-ProfilePath -Id $Name
     New-Item -ItemType Directory -Path $path -Force | Out-Null
     return (Resolve-ClaudeProfile -Name $Name -SkipStatus)
 }
@@ -707,9 +723,13 @@ function Rename-ClaudeProfile {
 function Remove-ClaudeProfile {
     param([Parameter(Mandatory)]$Target)
     if ($Target.IsDefault) { throw 'The Default profile cannot be deleted.' }
-    $path = Join-Path $script:ProfileRoot $Target.Id
-    # Never recurse into anything that is not a direct child of our own folder.
-    if ($Target.Id -match '^\.|[\\/]' -or (Split-Path $path -Parent) -ne $script:ProfileRoot) {
+    $path = Get-ProfilePath -Id $Target.Id
+    # Never recurse into anything but a profile folder of ours: ClaudeProfile-<id> directly
+    # under %LOCALAPPDATA%, or <id> in the old place.
+    $leaf = Split-Path $path -Leaf; $parent = Split-Path $path -Parent
+    $ours = ($parent -eq $env:LOCALAPPDATA.TrimEnd('\') -and $leaf -eq ($script:ProfileDirPrefix + $Target.Id)) -or
+            ($parent -eq $script:ProfileRoot -and $leaf -eq $Target.Id)
+    if ($Target.Id -match '^\.|[\\/]' -or -not $ours) {
         throw "Refusing to delete '$path'."
     }
     if ((Get-RunningProfileMap)[$path.TrimEnd('\')]) {
@@ -837,6 +857,57 @@ function Copy-CodeSession {
     [System.IO.File]::WriteAllText($dest, $text, (New-Object System.Text.UTF8Encoding($false)))
     return 'copied'
 }
+
+# ------------------------------------------------------------------- layout --
+
+function Move-LegacyProfileFolder {
+    # Profiles used to live in %LOCALAPPDATA%\ClaudeProfiles\<id>, where Cowork's VM never
+    # starts (see Get-ProfilePath). Each moves to its new place once. Same volume, so the
+    # move is a rename: it happens whole or not at all. A running profile holds its files
+    # open, so it stays put (Get-ProfilePath keeps finding it) and moves on a later start.
+    # An existing target is never overwritten, unless it holds no files at all.
+    if (-not (Test-Path -LiteralPath $script:ProfileRoot)) { return }
+    $old = @(Get-ChildItem -LiteralPath $script:ProfileRoot -Directory -ErrorAction SilentlyContinue | Where-Object { -not $_.Name.StartsWith('.') })
+    if (-not $old) { return }
+    $running = Get-RunningProfileMap
+    foreach ($d in $old) {
+        if ($running.ContainsKey($d.FullName.TrimEnd('\'))) { continue }
+        $target = Join-Path $env:LOCALAPPDATA ($script:ProfileDirPrefix + $d.Name)
+        # Not moving is safe (Get-ProfilePath keeps using the old folder) but worth a line in
+        # the log: otherwise nobody learns why Cowork still fails in that profile.
+        $why = $null
+        if (Test-Path -LiteralPath $target) {
+            if (@(Get-ChildItem -LiteralPath $target -Recurse -File -Force -ErrorAction SilentlyContinue).Count) {
+                $why = 'the new folder already holds files'
+            } else {
+                try { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop } catch { $why = "the empty new folder is in use: $($_.Exception.Message)" }
+            }
+        }
+        if (-not $why) { try { Move-Item -LiteralPath $d.FullName -Destination $target -ErrorAction Stop } catch { $why = $_.Exception.Message } }
+        if ($why) {
+            try { Add-Content -LiteralPath $script:LogPath -Value ("[{0}] Left profile '{1}' in {2}, not moved to {3}: {4}" -f (Get-Date -Format 's'), $d.Name, $d.FullName, $target, $why) } catch { }
+            continue
+        }
+        # The Store build can keep part of a profile's files in the package's LocalCache,
+        # under the same relative path (see Get-CodeSessionRoot). That part moves along.
+        # Left behind, those files (Code sessions among them) no longer show in the profile.
+        if ($script:ClaudeApp.Kind -eq 'Msix') {
+            $cache = Join-Path (Split-Path (Split-Path $script:ClaudeApp.DefaultProfilePath -Parent) -Parent) 'Local'
+            $from  = Join-Path $cache "ClaudeProfiles\$($d.Name)"
+            $to    = Join-Path $cache ($script:ProfileDirPrefix + $d.Name)
+            if (Test-Path -LiteralPath $from) {
+                $why = if (Test-Path -LiteralPath $to) { 'that folder already exists' } else { $null }
+                if (-not $why) { try { Move-Item -LiteralPath $from -Destination $to -ErrorAction Stop } catch { $why = $_.Exception.Message } }
+                if ($why) {
+                    try { Add-Content -LiteralPath $script:LogPath -Value ("[{0}] Left part of profile '{1}' in {2}, not moved to {3}: {4}" -f (Get-Date -Format 's'), $d.Name, $from, $to, $why) } catch { }
+                }
+            }
+        }
+    }
+}
+
+# Cheap when there is nothing to move: one directory listing.
+try { Move-LegacyProfileFolder } catch { }
 
 # ------------------------------------------------------------ console modes --
 

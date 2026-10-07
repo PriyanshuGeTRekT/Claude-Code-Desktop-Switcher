@@ -54,6 +54,8 @@ Run the isolated chat-transfer regression tests with Windows PowerShell 5.1 and 
 
     powershell -NoProfile -File .\tests\ChatTransfer.Tests.ps1
     pwsh -NoProfile -File .\tests\ChatTransfer.Tests.ps1
+    powershell -NoProfile -File .\tests\ProfileLayout.Tests.ps1
+    pwsh -NoProfile -File .\tests\ProfileLayout.Tests.ps1
 
 These tests use temporary session stores and never launch Claude or read real chats.
 
