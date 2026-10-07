@@ -188,10 +188,13 @@ sessions, shortcut icons, every tray menu item, and <kbd>Ctrl</kbd>+<kbd>N</kbd>
 delete, single instance behaviour and chat transfer (on sample data) were exercised end to
 end against a stand-in `Claude.exe`.
 
-**Not yet verified:** the **installer build** (no such install was available), **chat
-transfer between two real signed-in accounts**, and **per-account taskbar buttons** in their
-current form. If you can try any of these, `-List` is a harmless way to check detection, and
-there is an
+**Per-account taskbar buttons** were tested on Windows 11 (build 26200) with the Store build
+2.26454: separate buttons with their badges for accounts opened from the window, the Start
+menu, a shortcut with or without the tray running, and **Add account**.
+
+**Not yet verified:** the **installer build** (no such install was available) and **chat
+transfer between two real signed-in accounts**. If you can try either, `-List` is a harmless
+way to check detection, and there is an
 [issue template](.github/ISSUE_TEMPLATE/installer_build_report.yml) for reporting back. That
 is the most useful contribution anyone can make right now.
 
