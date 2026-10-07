@@ -221,6 +221,9 @@ outside the switcher, its old shortcut will report that the profile no longer ex
 - `claude://` links always open in the `Default` account.
 - Each running account is a full copy of the app, so budget roughly one Claude's worth of
   memory per account. A profile grows to a few hundred MB, mostly caches.
+- Each account that runs Cowork tasks locally starts its own Linux VM, which takes 4 GB of
+  memory while it runs and over 10 GB of disk in that profile's folder. Tasks run in the
+  cloud need neither.
 - This is about the desktop app only. The `claude` CLI uses its own `CLAUDE_CONFIG_DIR`
   environment variable for the same purpose.
 </details>
