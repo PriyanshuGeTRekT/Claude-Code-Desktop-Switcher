@@ -50,12 +50,15 @@ Install-Module PSScriptAnalyzer -Scope CurrentUser
 Invoke-ScriptAnalyzer -Path .\ClaudeSwitcher.ps1
 ```
 
-Run the isolated chat-transfer regression tests with Windows PowerShell 5.1 and PowerShell 7:
+Run the isolated regression tests with Windows PowerShell 5.1 and PowerShell 7:
 
     powershell -NoProfile -File .\tests\ChatTransfer.Tests.ps1
     pwsh -NoProfile -File .\tests\ChatTransfer.Tests.ps1
+    powershell -NoProfile -File .\tests\TaskbarIdentity.Tests.ps1
+    pwsh -NoProfile -File .\tests\TaskbarIdentity.Tests.ps1
 
-These tests use temporary session stores and never launch Claude or read real chats.
+These tests use temporary session stores and shortcuts, and never launch Claude or read real
+chats.
 
 Then actually run the thing. Most other behavior still needs manual checks because it
 touches real processes, real windows and real profile directories. At minimum, check that:
@@ -71,6 +74,8 @@ touches real processes, real windows and real profile directories. At minimum, c
 - `-List`, `-Launch`, `-Shortcut`, `-Tray` and `-Install` still behave.
 - A profile launched from a desktop shortcut opens a **visible** Claude window, and no
   console window flashes up on the way.
+- Each extra account's window gets its own taskbar button with its badge, whether it was
+  opened from the switcher, the tray or a shortcut, and `Default` keeps Claude's.
 
 That last one matters more than it looks. See the notes below.
 
