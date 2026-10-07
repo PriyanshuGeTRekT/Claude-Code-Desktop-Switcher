@@ -208,9 +208,15 @@ sessions, shortcut icons, every tray menu item, and <kbd>Ctrl</kbd>+<kbd>N</kbd>
 delete, single instance behaviour and chat transfer (on sample data) were exercised end to
 end against a stand-in `Claude.exe`.
 
-**Not yet verified:** the **installer build** (no such install was available), **chat
-transfer between two real signed-in accounts**, and **sign-in routing** in its current form.
-If you can try any of these, `-List` is a harmless way to check detection, and there is an
+**Sign-in routing** was tested on Windows 11 (build 26200) with the Store build 2.26454:
+turning it on and the one-time Default apps pick, each routing rule with test sign-in links,
+links that are not sign-ins, the `-HandleLink` guard (including a link carrying a quote and
+`-Revert`), and `-Revert` with and without the Default apps pick, which leaves the registry
+exactly as it was.
+
+**Not yet verified:** the **installer build** (no such install was available) and **chat
+transfer between two real signed-in accounts**. If you can try either, `-List` is a harmless
+way to check detection, and there is an
 [issue template](.github/ISSUE_TEMPLATE/installer_build_report.yml) for reporting back. That
 is the most useful contribution anyone can make right now.
 
