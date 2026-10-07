@@ -1089,12 +1089,15 @@ function Register-SignInRouter {
     $keys = Get-RouterRegistryPath
     $cmd  = Get-RouterCommand
     # Whatever Claude registered is saved once, before the first change, so -Revert can
-    # put it back exactly. A command of ours is never saved as the original.
+    # put it back exactly. A command of ours is never saved as the original. Whether the
+    # claude key existed is saved too: the Store build can leave a bare one with no
+    # command, which has to survive a revert.
     if (-not (Test-Path -LiteralPath $script:HandlerBackupPath)) {
         $existing = Get-RegistryDefault $keys.SchemeCommand
         if ($existing -notlike '* -HandleLink *') {
             New-Item -ItemType Directory -Force -Path (Split-Path $script:HandlerBackupPath -Parent) | Out-Null
-            @{ Command = $existing } | ConvertTo-Json | Set-Content -LiteralPath $script:HandlerBackupPath -Encoding UTF8
+            @{ Command = $existing; KeyExisted = (Test-Path -LiteralPath $keys.Scheme) } |
+                ConvertTo-Json | Set-Content -LiteralPath $script:HandlerBackupPath -Encoding UTF8
         }
     }
     Set-RegistryValue $keys.Scheme '(default)' "URL:$($script:LinkScheme)"
@@ -1141,21 +1144,30 @@ function Unregister-SignInRouter {
     # Returns one line per thing done, for -Revert and the tray to report.
     $keys = Get-RouterRegistryPath
     $done = New-Object System.Collections.Generic.List[string]
+    $backup = $null
     if (Test-Path -LiteralPath $script:HandlerBackupPath) {
-        $saved = $null
-        try { $saved = (Get-Content -LiteralPath $script:HandlerBackupPath -Raw | ConvertFrom-Json).Command } catch { }
-        if ($saved) {
-            Set-RegistryValue $keys.SchemeCommand '(default)' $saved
-            $done.Add('put back the claude:// handler Claude had registered')
-        } elseif ((Get-RegistryDefault $keys.SchemeCommand) -like '* -HandleLink *') {
-            Remove-Item -LiteralPath $keys.Scheme -Recurse -Force
-            $done.Add('removed our claude:// handler; Claude registers its own the next time it starts')
-        }
-        Remove-Item -LiteralPath $script:HandlerBackupPath -Force
+        try { $backup = Get-Content -LiteralPath $script:HandlerBackupPath -Raw | ConvertFrom-Json } catch { }
+    }
+    if ($backup -and $backup.Command) {
+        Set-RegistryValue $keys.SchemeCommand '(default)' $backup.Command
+        $done.Add('put back the claude:// handler Claude had registered')
     } elseif ((Get-RegistryDefault $keys.SchemeCommand) -like '* -HandleLink *') {
-        Remove-Item -LiteralPath $keys.Scheme -Recurse -Force
+        # No command of Claude's to put back. Remove the whole key only when the backup
+        # says we created it; otherwise (or without a backup) keep the key and take out
+        # just the command we added.
+        if ($backup -and $backup.PSObject.Properties.Name -contains 'KeyExisted' -and -not $backup.KeyExisted) {
+            Remove-Item -LiteralPath $keys.Scheme -Recurse -Force
+        } else {
+            Remove-Item -LiteralPath $keys.SchemeCommand -Recurse -Force
+            foreach ($k in "$($keys.Scheme)\shell\open", "$($keys.Scheme)\shell") {
+                if ((Test-Path -LiteralPath $k) -and -not (Get-ChildItem -LiteralPath $k) -and -not (Get-Item -LiteralPath $k).Property) {
+                    Remove-Item -LiteralPath $k -Force
+                }
+            }
+        }
         $done.Add('removed our claude:// handler; Claude registers its own the next time it starts')
     }
+    if (Test-Path -LiteralPath $script:HandlerBackupPath) { Remove-Item -LiteralPath $script:HandlerBackupPath -Force }
 
     if ((Get-LinkHandlerProgId) -eq $script:RouterProgId) {
         # Picked in Settings > Default apps, and only Settings can change that. Deleting the

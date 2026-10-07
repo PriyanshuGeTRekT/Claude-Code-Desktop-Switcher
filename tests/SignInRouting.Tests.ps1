@@ -179,6 +179,23 @@ try {
     $null = Unregister-SignInRouter
     Assert (-not (Test-Path -LiteralPath $keys.Scheme)) 'Handler key we created was left behind'
 
+    # A bare claude key with no command, as the Store build can leave behind, survives a revert.
+    Set-RegistryValue $keys.Scheme '(default)' 'URL:claude'
+    Set-RegistryValue $keys.Scheme 'URL Protocol' ''
+    Register-SignInRouter
+    Assert ((Get-Content -LiteralPath $script:HandlerBackupPath -Raw | ConvertFrom-Json).KeyExisted -eq $true) 'Existing key not recorded'
+    $null = Unregister-SignInRouter
+    Assert (Test-Path -LiteralPath $keys.Scheme) 'Pre-existing claude key deleted'
+    Assert (-not (Test-Path -LiteralPath "$($keys.Scheme)\shell")) 'Our command left in the pre-existing key'
+    Assert (@((Get-Item -LiteralPath $keys.Scheme).Property) -contains 'URL Protocol') 'Pre-existing key lost its values'
+
+    # Without a backup, only our command goes; the key is kept rather than guessed about.
+    Register-SignInRouter
+    Remove-Item -LiteralPath $script:HandlerBackupPath -Force
+    $null = Unregister-SignInRouter
+    Assert ((Test-Path -LiteralPath $keys.Scheme) -and -not (Test-Path -LiteralPath $keys.SchemeCommand)) 'Revert without a backup removed too much or too little'
+    Remove-Item -LiteralPath $keys.Scheme -Recurse -Force
+
     # Turning it off with nothing left to undo reports nothing, rather than one empty line.
     $script:RouterLogPath = Join-Path $fixture 'sign-in-router.log'
     $script:ProfileRoot   = $fixture
@@ -186,7 +203,7 @@ try {
     Assert ($done.Count -eq 0) "Nothing to undo, yet $($done.Count) line(s) reported"
     Assert (-not (Test-SignInRoutingOn)) 'Routing still on after turning it off'
 
-    Write-Output 'PASS: link validation, sign-in shapes, target selection, signed-in detection, pending marker, setting, Store paths, router command, registry round trip, revert with and without a Default apps pick.'
+    Write-Output 'PASS: link validation, sign-in shapes, target selection, signed-in detection, pending marker, setting, Store paths, router command, registry round trip, revert with and without a Default apps pick, pre-existing bare key, missing backup.'
 } finally {
     $env:LOCALAPPDATA = $originalLocal
     if ($onWindows) {
