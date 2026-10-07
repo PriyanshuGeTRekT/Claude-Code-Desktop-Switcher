@@ -94,6 +94,8 @@ colour, and clicking a shortcut for an account that is already open simply bring
 Each extra account's window also gets its own taskbar button with the same badge, instead of
 piling onto Claude's. A pinned profile shortcut shares that button with the window it opens.
 `Default` keeps Claude's own button, so an existing pinned Claude icon still matches it.
+Windows takes that button's icon from the account's Start menu shortcut, so launching an
+account that has none creates it.
 
 ### Moving Claude Code chats between accounts
 

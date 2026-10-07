@@ -440,6 +440,14 @@ function Start-ClaudeProfile {
     if (-not (Test-Path -LiteralPath $path)) {
         New-Item -ItemType Directory -Path $path -Force | Out-Null
     }
+    # The taskbar takes a custom group's icon from the Start menu shortcut carrying the
+    # same identity, and shows Claude's plain icon without one. Made before Claude starts,
+    # so it is there when the button is created. Cosmetic, so a failure is ignored.
+    $startMenu = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'
+    $target = Resolve-ClaudeProfile -Name $Id -SkipStatus
+    if ($target -and -not (Test-Path -LiteralPath (Join-Path $startMenu "Claude - $($target.Name).lnk"))) {
+        try { New-ProfileShortcut -Target $target -Directory $startMenu | Out-Null } catch { }
+    }
     # -WindowStyle Normal matters: shortcuts run us without a window, and without an
     # explicit show state Claude would inherit ours and start with an invisible window.
     # The process is kept so its window can be given the profile's taskbar identity.
