@@ -766,9 +766,25 @@ function Get-FirstValue {
     return $null
 }
 
+function Get-CodeSessionRoot {
+    param([Parameter(Mandatory)]$TargetProfile)
+    $root = Join-Path $TargetProfile.Path 'claude-code-sessions'
+    # Store apps redirect LocalAppData writes into their package's LocalCache.
+    # Keep the launch path unchanged; only resolve where the session files live.
+    $localPrefix = $env:LOCALAPPDATA.TrimEnd('\') + '\'
+    if ($script:ClaudeApp.Kind -eq 'Msix' -and
+        $TargetProfile.Path.StartsWith($localPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        $cache = Split-Path (Split-Path $script:ClaudeApp.DefaultProfilePath -Parent) -Parent
+        $relative = $TargetProfile.Path.Substring($localPrefix.Length)
+        $redirected = Join-Path (Join-Path (Join-Path $cache 'Local') $relative) 'claude-code-sessions'
+        if (Test-Path -LiteralPath $redirected -PathType Container) { return $redirected }
+    }
+    return $root
+}
+
 function Get-CodeSessions {
     param([Parameter(Mandatory)]$Source)
-    $root = Join-Path $Source.Path 'claude-code-sessions'
+    $root = Get-CodeSessionRoot -TargetProfile $Source
     if (-not (Test-Path -LiteralPath $root)) { return @() }
     $found = @{}
     Get-ChildItem -LiteralPath $root -Directory | ForEach-Object {
@@ -798,7 +814,7 @@ function Get-CodeSessions {
 
 function Get-CodeSessionStore {
     param([Parameter(Mandatory)]$Target)
-    $root = Join-Path $Target.Path 'claude-code-sessions'
+    $root = Get-CodeSessionRoot -TargetProfile $Target
     if (-not (Test-Path -LiteralPath $root)) { return $null }
     # A profile that has been signed in to more than one account keeps a folder for each;
     # the one written to most recently belongs to whoever is signed in now.
