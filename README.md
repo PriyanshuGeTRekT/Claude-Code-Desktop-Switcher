@@ -26,6 +26,7 @@
 | **Concurrent accounts** | Every account runs in its own window. Open as many as you like at the same time. |
 | **One click to switch** | Launch a profile, or bring it to the front if it is already open. Also from the tray. |
 | **Move Claude Code chats** | Copy chats from one account to another and carry on where you left off. |
+| **Sign-ins land in the right account** | Optional: a browser sign-in comes back to the account that asked for it, not to your original one. |
 | **Icons you can tell apart** | Each profile gets a coloured badge for its desktop and Start menu shortcuts. |
 | **Nothing to install** | One PowerShell script. No patching, no proxy, no credential juggling. |
 | **Your original stays put** | The account you already have is never touched and keeps auto update and `claude://` links. |
@@ -83,6 +84,24 @@ Closing the window keeps the switcher in the notification area. Right-click the 
 jump to any account (open ones are ticked), add an account, or turn on **Start with Windows**. Untick
 **Keep running in the tray** in the window if you would rather it quit on close.
 
+### Signing in from the browser
+
+Signing in to Claude in the browser finishes with a `claude://` link, and Windows sends every
+one of those to your original account. The first time you add an account, the switcher offers
+to handle those links instead and pass each sign-in to the account that asked for it. You can
+turn this on or off later from the tray icon (**Send sign-ins to the right account**), or with
+`-RouteSignIns` and `-Revert`.
+
+A sign-in goes to the first of these that applies: the account you launched while it was
+signed out, the only open account that is signed out, the open account whose window you used
+last, and otherwise `Default`. Every other `claude://` link still opens in `Default`.
+
+> [!NOTE]
+> On the Store build, Windows keeps sending `claude://` links to Claude until you choose
+> otherwise, and only you can make that choice. Turning this on opens Settings at the right
+> page: set **CLAUDE** to **Claude Profile Router**. `-Status` shows whether that step is
+> still to do.
+
 ### Shortcuts
 
 <img src="docs/images/icons.png" alt="Shortcut icons: plain Claude for Default, then coloured W, P and C badges" width="600">
@@ -118,6 +137,9 @@ one account before picking it up in the other.
 | `.\ClaudeSwitcher.ps1 -Tray` | Start in the tray without the window |
 | `.\ClaudeSwitcher.ps1 -Install` | Install (or refresh an install and its shortcuts), then open the switcher |
 | `.\ClaudeSwitcher.ps1 -ClaudePath <exe>` | Point at `Claude.exe` if detection fails (remembered) |
+| `.\ClaudeSwitcher.ps1 -RouteSignIns` | Send browser sign-ins to the account that asked for them |
+| `.\ClaudeSwitcher.ps1 -Status` | Show whether sign-in routing is working, and which open accounts are signed in |
+| `.\ClaudeSwitcher.ps1 -Revert` | Turn sign-in routing off and put the original `claude://` handler back |
 
 `-Launch` and `-Shortcut` accept either a profile's name or its folder name.
 
@@ -154,6 +176,16 @@ Claude ships in two shapes on Windows, and the switcher detects whichever you ha
   rather than by running the `.exe`, so it keeps full package identity: `claude://` links, the
   native messaging host and auto update behave exactly as before. Profiles this tool creates
   live in `%LOCALAPPDATA%\ClaudeProfiles`, nowhere near Claude's own data.
+- **Sign-in routing is off until you turn it on.** It then writes the `claude://` handler under
+  `HKCU\Software\Classes\claude`, a `ClaudeProfileRouter.claude` entry beside it, and an entry
+  under `HKCU\Software\ClaudeProfileSwitcher` and `HKCU\Software\RegisteredApplications` so
+  that Settings can offer it as an app for `claude://` links. Claude's own handler is saved to
+  `.switcher\claude-handler-backup.json` first and put back by `-Revert`. Claude rewrites its
+  handler every time it starts, so the switcher takes it back whenever it notices.
+- **The router never logs a link**, because a sign-in link carries a one-time code. It
+  refuses any link that is not `claude://` followed by ordinary URL characters, and decides
+  whether an account is signed in from the presence and length of keys in its `config.json`,
+  never from the token itself. `.switcher\sign-in-router.log` records where each sign-in went.
 - **Install paths contain the version number**, so they change with every update. Shortcuts
   resolve the executable when clicked and carry their own icon files, so they keep working
   and keep their icons after Claude updates itself.
@@ -175,6 +207,12 @@ switching to (and restoring) an open account, running detection alongside Claude
 sessions, shortcut icons, every tray menu item, and <kbd>Ctrl</kbd>+<kbd>N</kbd>. Rename,
 delete, single instance behaviour and chat transfer (on sample data) were exercised end to
 end against a stand-in `Claude.exe`.
+
+**Sign-in routing** was tested on Windows 11 (build 26200) with the Store build 2.26454:
+turning it on and the one-time Default apps pick, each routing rule with test sign-in links,
+links that are not sign-ins, the `-HandleLink` guard (including a link carrying a quote and
+`-Revert`), and `-Revert` with and without the Default apps pick, which leaves the registry
+exactly as it was.
 
 **Not yet verified:** the **installer build** (no such install was available) and **chat
 transfer between two real signed-in accounts**. If you can try either, `-List` is a harmless
@@ -211,7 +249,8 @@ outside the switcher, its old shortcut will report that the profile no longer ex
 - Every instance shares Claude's taskbar identity, so open accounts group under one taskbar
   button with the same icon. Hover to see each window.
 - A pinned profile shortcut shows up as a separate taskbar button from the window it opens.
-- `claude://` links always open in the `Default` account.
+- `claude://` links open in the `Default` account, except sign-ins once
+  [sign-in routing](#signing-in-from-the-browser) is on.
 - Each running account is a full copy of the app, so budget roughly one Claude's worth of
   memory per account. A profile grows to a few hundred MB, mostly caches.
 - This is about the desktop app only. The `claude` CLI uses its own `CLAUDE_CONFIG_DIR`
