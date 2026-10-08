@@ -118,6 +118,26 @@ $script:InstalledScript = Join-Path $script:SwitcherHome 'ClaudeSwitcher.ps1'
 $script:SettingsPath    = Join-Path $script:ProfileRoot 'settings.json'
 $script:DefaultName     = 'Default'
 $script:ScriptPath      = $MyInvocation.MyCommand.Path
+$script:RouterLogPath   = Join-Path $script:SwitcherHome 'sign-in-router.log'
+
+function Test-HandleLinkAlone {
+    # -HandleLink carries a link from the browser, and Windows hands a quote inside it to
+    # this script as separate arguments, so a crafted link can bring parameters of its own.
+    # With -HandleLink, nothing else may be bound.
+    param([Collections.IDictionary]$Bound)
+    return ($Bound.Keys -notcontains 'HandleLink') -or ($Bound.Count -eq 1)
+}
+
+# Checked before any parameter is acted on: -ClaudePath, for one, is saved to settings.json
+# further down, and every later run would launch it. Write-RouterLog is not defined yet,
+# hence the direct write.
+if (-not (Test-HandleLinkAlone -Bound $PSBoundParameters)) {
+    try {
+        New-Item -ItemType Directory -Force -Path $script:SwitcherHome | Out-Null
+        Add-Content -LiteralPath $script:RouterLogPath -Value ('[{0}] Refused: -HandleLink arrived together with other parameters.' -f (Get-Date -Format 's'))
+    } catch { }
+    return
+}
 
 function Get-Setting {
     param([Parameter(Mandatory)][string]$Name)
@@ -905,7 +925,7 @@ $script:RouterRegistry    = [pscustomobject]@{
 }
 $script:PendingSignInPath = Join-Path $script:SwitcherHome 'pending-sign-in.json'
 $script:HandlerBackupPath = Join-Path $script:SwitcherHome 'claude-handler-backup.json'
-$script:RouterLogPath     = Join-Path $script:SwitcherHome 'sign-in-router.log'
+# $script:RouterLogPath is set near the top, where a link arriving with other parameters is refused.
 
 function Test-SignInRoutingOn { return ((Get-Setting 'SignInRouting') -eq $true) }
 
@@ -1341,13 +1361,10 @@ function Invoke-SignInRouter {
 # ------------------------------------------------------------ console modes --
 
 if ($PSBoundParameters.ContainsKey('HandleLink')) {
-    # Windows runs this for every claude:// link once routing is on. The link is untrusted,
-    # so nothing may ride along with it: a crafted link must not add -Revert, -ClaudePath
-    # or a stray positional argument. An empty one is refused below, never the window.
-    if ($PSBoundParameters.Count -ne 1) {
-        Write-RouterLog 'Refused: -HandleLink arrived together with other parameters.'
-        return
-    }
+    # Windows runs this for every claude:// link once routing is on. The link is untrusted:
+    # anything that rode along with it (-Revert, -ClaudePath, a stray positional argument)
+    # was refused at the top, before any parameter was acted on (Test-HandleLinkAlone). An
+    # empty link is refused by the router, never the window.
     Invoke-SignInRouter -Link $HandleLink
     return
 }

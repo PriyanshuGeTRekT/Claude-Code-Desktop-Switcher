@@ -7,7 +7,7 @@ foreach ($name in @('Get-Setting','Test-SignInRoutingOn','Test-SafeLink','Test-S
                     'Set-PendingSignIn','Get-PendingSignIn','Clear-PendingSignIn','Select-SignInTarget','Get-LauncherScript',
                     'Get-RouterCommand','Get-RegistryDefault','Set-RegistryValue','Get-RouterRegistryPath','Test-RouterRegistered',
                     'Register-SignInRouter','Test-RouterChosen','Unregister-SignInRouter','Set-Setting','Write-RouterLog',
-                    'Disable-SignInRouting')) {
+                    'Disable-SignInRouting','Test-HandleLinkAlone')) {
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}, $true)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
@@ -102,8 +102,33 @@ try {
     [IO.File]::WriteAllText($script:SettingsPath, '{"SignInRouting":true}')
     Assert (Test-SignInRoutingOn) 'Routing setting not read'
 
+    # A crafted link can bring parameters of its own (Windows splits a quote in it into
+    # separate arguments). With -HandleLink nothing else may be bound...
+    Assert (Test-HandleLinkAlone -Bound @{ HandleLink = 'claude://login/x' }) 'Lone link refused'
+    Assert (-not (Test-HandleLinkAlone -Bound @{ HandleLink = 'claude://login/x'; ClaudePath = 'x.exe' })) 'Link with -ClaudePath accepted'
+    Assert (-not (Test-HandleLinkAlone -Bound @{ HandleLink = 'claude://login/x'; Revert = $true })) 'Link with -Revert accepted'
+    Assert (Test-HandleLinkAlone -Bound @{}) 'Plain start refused'
+    Assert (Test-HandleLinkAlone -Bound @{ ClaudePath = 'x.exe'; Launch = 'Work' }) 'Normal parameters refused'
+    # ...and it is refused before any parameter is acted on. Run the real script: -ClaudePath
+    # used to be saved to settings.json before the check, so every later run launched it.
+    $guardLocal = Join-Path $fixture 'LinkGuard'
+    $fakeExe = Join-Path $fixture 'not-claude.exe'
+    [IO.File]::WriteAllText($fakeExe, '')
+    $engine = (Get-Process -Id $PID).Path
+    $originalRoaming = $env:APPDATA
+    $env:LOCALAPPDATA = $guardLocal
+    $env:APPDATA = Join-Path $fixture 'LinkGuardRoaming'   # set everywhere, so the old order would get as far as saving
+    try {
+        & $engine -NoProfile -ExecutionPolicy Bypass -File $source -HandleLink 'claude://login/x' -ClaudePath $fakeExe 2>&1 | Out-Null
+    } finally { $env:LOCALAPPDATA = $originalLocal; $env:APPDATA = $originalRoaming }
+    $guardSettings = Join-Path $guardLocal 'ClaudeProfiles\settings.json'
+    $saved = $(if (Test-Path -LiteralPath $guardSettings) { Get-Content -LiteralPath $guardSettings -Raw | ConvertFrom-Json })
+    Assert (-not ($saved -and $saved.PSObject.Properties.Name -contains 'ClaudePath')) '-ClaudePath riding along with a link was saved'
+    $guardLog = Join-Path $guardLocal 'ClaudeProfiles\.switcher\sign-in-router.log'
+    Assert ((Test-Path -LiteralPath $guardLog) -and ((Get-Content -LiteralPath $guardLog -Raw) -match 'Refused')) 'Link with other parameters not refused'
+
     if (-not $onWindows) {
-        Write-Output 'PASS (portable part): link validation, sign-in shapes, target selection, signed-in detection, pending marker, setting.'
+        Write-Output 'PASS (portable part): link validation, sign-in shapes, target selection, signed-in detection, pending marker, setting, link guard.'
         return
     }
 
@@ -212,7 +237,7 @@ try {
     Assert ($done.Count -eq 0) "Nothing to undo, yet $($done.Count) line(s) reported"
     Assert (-not (Test-SignInRoutingOn)) 'Routing still on after turning it off'
 
-    Write-Output 'PASS: link validation, sign-in shapes, target selection, signed-in detection, pending marker, setting, Store paths, router command, registry round trip, revert with and without a Default apps pick, pre-existing bare key, missing backup.'
+    Write-Output 'PASS: link validation, sign-in shapes, target selection, signed-in detection, pending marker, setting, link guard, Store paths, router command, registry round trip, revert with and without a Default apps pick, pre-existing bare key, missing backup.'
 } finally {
     $env:LOCALAPPDATA = $originalLocal
     if ($onWindows) {
