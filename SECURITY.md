@@ -7,6 +7,14 @@ starts the Claude desktop app with a `--user-data-dir` argument, and creates sho
 It does not modify the Claude application, handle credentials, or make network requests
 of its own.
 
+If you turn on sign-in routing, the switcher also becomes the handler for `claude://` links,
+which means it receives text from your browser. Each link is checked before use: only
+`claude://` followed by characters a URL may contain, at most 2048 of them, is passed on to
+Claude, so quotes, spaces and control characters cannot add arguments to Claude's command
+line. The handler refuses to run when anything other than the link is passed to it, and it
+never writes a link to its log, because a sign-in link carries a one-time code. Reports
+about this part are especially welcome.
+
 Profile directories contain live login sessions for whichever account signed in there.
 Treat them like any other browser profile. Anyone with read access to your user account
 can use them, and deleting a profile directory signs that account out on that machine.
