@@ -50,12 +50,16 @@ Install-Module PSScriptAnalyzer -Scope CurrentUser
 Invoke-ScriptAnalyzer -Path .\ClaudeSwitcher.ps1
 ```
 
-Run the isolated chat-transfer regression tests with Windows PowerShell 5.1 and PowerShell 7:
+Run the isolated regression tests with Windows PowerShell 5.1 and PowerShell 7:
 
     powershell -NoProfile -File .\tests\ChatTransfer.Tests.ps1
     pwsh -NoProfile -File .\tests\ChatTransfer.Tests.ps1
+    powershell -NoProfile -File .\tests\SignInRouting.Tests.ps1
+    pwsh -NoProfile -File .\tests\SignInRouting.Tests.ps1
 
-These tests use temporary session stores and never launch Claude or read real chats.
+These tests use temporary session stores and never launch Claude or read real chats. The
+sign-in routing tests write only under a throwaway `HKCU\Software\ClaudeProfileSwitcherTests`
+key, which they delete again, and never touch your real `claude://` handler.
 
 Then actually run the thing. Most other behavior still needs manual checks because it
 touches real processes, real windows and real profile directories. At minimum, check that:
@@ -71,6 +75,10 @@ touches real processes, real windows and real profile directories. At minimum, c
 - `-List`, `-Launch`, `-Shortcut`, `-Tray` and `-Install` still behave.
 - A profile launched from a desktop shortcut opens a **visible** Claude window, and no
   console window flashes up on the way.
+- If you touched sign-in routing: with it on, signing in to a newly added account in the
+  browser lands in that account, `-Status` reports it correctly, and `-Revert` leaves
+  `claude://` links opening Claude as before. On the Store build this needs the one-time
+  pick in Settings > Default apps.
 
 That last one matters more than it looks. See the notes below.
 
@@ -130,4 +138,6 @@ if there is anything in it.
 
 The switcher's own files (installed copy, icons) live in
 `%LOCALAPPDATA%\ClaudeProfiles\.switcher`, and settings, labels and colours in
-`%LOCALAPPDATA%\ClaudeProfiles\settings.json`.
+`%LOCALAPPDATA%\ClaudeProfiles\settings.json`. For sign-in problems, include
+`.switcher\sign-in-router.log` and the output of `-Status`. Neither contains a sign-in link
+or token, but `-Status` prints paths, so replace your username there as described above.
