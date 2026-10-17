@@ -27,7 +27,7 @@
 | **One click to switch** | Launch a profile, or bring it to the front if it is already open. Also from the tray. |
 | **Move Claude Code chats** | Copy chats from one account to another and carry on where you left off. |
 | **Sign-ins land in the right account** | Optional: a browser sign-in comes back to the account that asked for it, not to your original one. |
-| **Icons you can tell apart** | Each profile gets a coloured badge for its desktop and Start menu shortcuts. |
+| **Icons you can tell apart** | Each profile gets a coloured badge for its shortcuts and its own taskbar button. |
 | **Nothing to install** | One PowerShell script. No patching, no proxy, no credential juggling. |
 | **Your original stays put** | The account you already have is never touched and keeps auto update and `claude://` links. |
 
@@ -110,6 +110,12 @@ last, and otherwise `Default`. Every other `claude://` link still opens in `Defa
 you can search for an account or pin it and skip the switcher entirely. Each profile keeps its
 colour, and clicking a shortcut for an account that is already open simply brings it forward.
 
+Each extra account's window also gets its own taskbar button with the same badge, instead of
+piling onto Claude's. A pinned profile shortcut shares that button with the window it opens.
+`Default` keeps Claude's own button, so an existing pinned Claude icon still matches it.
+Windows takes that button's icon from the account's Start menu shortcut, so launching an
+account that has none creates it.
+
 ### Moving Claude Code chats between accounts
 
 <img src="docs/images/transfer.png" alt="The transfer dialog with three chats ticked" width="600">
@@ -189,6 +195,12 @@ Claude ships in two shapes on Windows, and the switcher detects whichever you ha
 - **Install paths contain the version number**, so they change with every update. Shortcuts
   resolve the executable when clicked and carry their own icon files, so they keep working
   and keep their icons after Claude updates itself.
+- **Taskbar buttons** are grouped by an identifier called the AppUserModelID, and every Claude
+  window carries the same one. The switcher gives each extra account's window an identifier
+  of its own, with the badged icon, in the moment between Claude creating the window and
+  showing it. Windows reads a button's icon once per identifier, so the badge letter is part
+  of it: a rename that changes the letter gives the window a new identifier and a new icon.
+  Nothing is written to the registry, and Claude drops the identifier when it restarts.
 - **Running detection** only counts the desktop app's own process. The Claude Code CLI is also
   called `claude.exe` and the desktop app starts one per Code session; those are ignored.
 - **Renaming** changes a label only. The folder name is a profile's permanent id, because
@@ -213,6 +225,10 @@ turning it on and the one-time Default apps pick, each routing rule with test si
 links that are not sign-ins, the `-HandleLink` guard (including a link carrying a quote and
 `-Revert`), and `-Revert` with and without the Default apps pick, which leaves the registry
 exactly as it was.
+
+**Per-account taskbar buttons** were tested on Windows 11 (build 26200) with the Store build
+2.26454: separate buttons with their badges for accounts opened from the window, the Start
+menu, a shortcut with or without the tray running, and **Add account**.
 
 **Not yet verified:** the **installer build** (no such install was available) and **chat
 transfer between two real signed-in accounts**. If you can try either, `-List` is a harmless
@@ -246,9 +262,10 @@ outside the switcher, its old shortcut will report that the profile no longer ex
 <details>
 <summary><b>Known limitations</b></summary>
 
-- Every instance shares Claude's taskbar identity, so open accounts group under one taskbar
-  button with the same icon. Hover to see each window.
-- A pinned profile shortcut shows up as a separate taskbar button from the window it opens.
+- Renaming a profile so that its badge letter changes gives its window a new taskbar
+  identity. A copy of its shortcut pinned before the rename stops matching the window until
+  you unpin it and pin the renamed shortcut. Desktop and Start menu shortcuts are updated
+  automatically; pinned ones cannot be.
 - `claude://` links open in the `Default` account, except sign-ins once
   [sign-in routing](#signing-in-from-the-browser) is on.
 - Each running account is a full copy of the app, so budget roughly one Claude's worth of

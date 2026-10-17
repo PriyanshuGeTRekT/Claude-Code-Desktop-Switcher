@@ -56,10 +56,13 @@ Run the isolated regression tests with Windows PowerShell 5.1 and PowerShell 7:
     pwsh -NoProfile -File .\tests\ChatTransfer.Tests.ps1
     powershell -NoProfile -File .\tests\SignInRouting.Tests.ps1
     pwsh -NoProfile -File .\tests\SignInRouting.Tests.ps1
+    powershell -NoProfile -File .\tests\TaskbarIdentity.Tests.ps1
+    pwsh -NoProfile -File .\tests\TaskbarIdentity.Tests.ps1
 
-These tests use temporary session stores and never launch Claude or read real chats. The
-sign-in routing tests write only under a throwaway `HKCU\Software\ClaudeProfileSwitcherTests`
-key, which they delete again, and never touch your real `claude://` handler.
+These tests use temporary session stores and shortcuts, and never launch Claude or read
+real chats. The sign-in routing tests write only under a throwaway
+`HKCU\Software\ClaudeProfileSwitcherTests` key, which they delete again, and never touch
+your real `claude://` handler.
 
 Then actually run the thing. Most other behavior still needs manual checks because it
 touches real processes, real windows and real profile directories. At minimum, check that:
@@ -79,6 +82,8 @@ touches real processes, real windows and real profile directories. At minimum, c
   browser lands in that account, `-Status` reports it correctly, and `-Revert` leaves
   `claude://` links opening Claude as before. On the Store build this needs the one-time
   pick in Settings > Default apps.
+- Each extra account's window gets its own taskbar button with its badge, whether it was
+  opened from the switcher, the tray or a shortcut, and `Default` keeps Claude's.
 
 That last one matters more than it looks. See the notes below.
 
