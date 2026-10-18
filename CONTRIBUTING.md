@@ -54,6 +54,9 @@ Run the isolated regression tests with Windows PowerShell 5.1 and PowerShell 7:
 
     powershell -NoProfile -File .\tests\ChatTransfer.Tests.ps1
     pwsh -NoProfile -File .\tests\ChatTransfer.Tests.ps1
+    powershell -NoProfile -File .\tests\ProfileLayout.Tests.ps1
+    pwsh -NoProfile -File .\tests\ProfileLayout.Tests.ps1
+
     powershell -NoProfile -File .\tests\SignInRouting.Tests.ps1
     pwsh -NoProfile -File .\tests\SignInRouting.Tests.ps1
     powershell -NoProfile -File .\tests\TaskbarIdentity.Tests.ps1
