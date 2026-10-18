@@ -254,6 +254,13 @@ public static extern uint PrivateExtractIcons(string file, int index, int cx, in
 
 # ----------------------------------------------------------------- profiles --
 
+# The junction left at a moved profile's old place (see Move-LegacyProfileFolder).
+function Test-Junction {
+    param([Parameter(Mandatory)][string]$Path)
+    $i = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    return [bool]($i -and ($i.Attributes -band [IO.FileAttributes]::ReparsePoint))
+}
+
 function Get-ProfilePath {
     param([Parameter(Mandatory)][string]$Id)
     if ($Id -eq $script:DefaultName) { return $script:DefaultProfilePath }
@@ -265,7 +272,7 @@ function Get-ProfilePath {
     # Not moved yet (it was running, see Move-LegacyProfileFolder): keep using the old
     # folder rather than start an empty profile. Also when only an empty leftover sits
     # at the new place, which a half-finished manual move can leave behind.
-    if ((Test-Path -LiteralPath $legacy) -and -not (Test-Path -LiteralPath (Join-Path $path 'config.json'))) { return $legacy }
+    if ((Test-Path -LiteralPath $legacy) -and -not (Test-Junction $legacy) -and -not (Test-Path -LiteralPath (Join-Path $path 'config.json'))) { return $legacy }
     return $path
 }
 
@@ -350,7 +357,7 @@ function Get-ProfileList {
     # Plus any still in the old place, because they were running when the move was tried.
     if (Test-Path -LiteralPath $script:ProfileRoot) {
         $found += @(Get-ChildItem -LiteralPath $script:ProfileRoot -Directory -ErrorAction SilentlyContinue |
-                    Where-Object { -not $_.Name.StartsWith('.') } | ForEach-Object { $_.Name })
+                    Where-Object { -not $_.Name.StartsWith('.') -and -not (Test-Junction $_.FullName) } | ForEach-Object { $_.Name })
     }
     $found | Where-Object { $_ -and $_ -ne $script:DefaultName } | Sort-Object -Unique | ForEach-Object { $ids.Add($_) }
 
@@ -736,6 +743,9 @@ function Remove-ClaudeProfile {
         throw "Close the '$($Target.Name)' window before deleting it."
     }
     if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+    # Takes the junction at the old place with it (Directory.Delete leaves its target alone).
+    $link = Join-Path $script:ProfileRoot $Target.Id
+    if (Test-Junction $link) { [IO.Directory]::Delete($link, $false) }
     Remove-ProfileShortcuts -Label $Target.Name | Out-Null
     $stale = '^' + [regex]::Escape($Target.Id) + '(-.)?$'
     Get-ChildItem -LiteralPath $script:IconDir -Filter '*.ico' -ErrorAction SilentlyContinue |
@@ -867,7 +877,7 @@ function Move-LegacyProfileFolder {
     # open, so it stays put (Get-ProfilePath keeps finding it) and moves on a later start.
     # An existing target is never overwritten, unless it holds no files at all.
     if (-not (Test-Path -LiteralPath $script:ProfileRoot)) { return }
-    $old = @(Get-ChildItem -LiteralPath $script:ProfileRoot -Directory -ErrorAction SilentlyContinue | Where-Object { -not $_.Name.StartsWith('.') })
+    $old = @(Get-ChildItem -LiteralPath $script:ProfileRoot -Directory -ErrorAction SilentlyContinue | Where-Object { -not $_.Name.StartsWith('.') -and -not (Test-Junction $_.FullName) })
     if (-not $old) { return }
     $running = Get-RunningProfileMap
     foreach ($d in $old) {
@@ -888,6 +898,11 @@ function Move-LegacyProfileFolder {
             try { Add-Content -LiteralPath $script:LogPath -Value ("[{0}] Left profile '{1}' in {2}, not moved to {3}: {4}" -f (Get-Date -Format 's'), $d.Name, $d.FullName, $target, $why) } catch { }
             continue
         }
+        # Claude writes absolute paths into a profile, the working folder of a Code chat
+        # started without a project among them. A junction at the old place keeps them
+        # resolving. Cowork's VM service only looks at the new name, so it never sees it.
+        try { New-Item -ItemType Junction -Path $d.FullName -Target $target -ErrorAction Stop | Out-Null }
+        catch { try { Add-Content -LiteralPath $script:LogPath -Value ("[{0}] Moved profile '{1}' but could not leave a junction at {2}: {3}" -f (Get-Date -Format 's'), $d.Name, $d.FullName, $_.Exception.Message) } catch { } }
         # The Store build can keep part of a profile's files in the package's LocalCache,
         # under the same relative path (see Get-CodeSessionRoot). That part moves along.
         # Left behind, those files (Code sessions among them) no longer show in the profile.

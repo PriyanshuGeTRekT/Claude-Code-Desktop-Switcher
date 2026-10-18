@@ -3,7 +3,7 @@ $source = Join-Path (Split-Path $PSScriptRoot -Parent) 'ClaudeSwitcher.ps1'
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$null, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in @('Get-Setting','Get-ProfilePath','Get-ProfileLabels','Get-ProfileList','Resolve-ClaudeProfile','Test-ProfileName','Move-LegacyProfileFolder')) {
+foreach ($name in @('Get-Setting','Test-Junction','Get-ProfilePath','Get-ProfileLabels','Get-ProfileList','Resolve-ClaudeProfile','Test-ProfileName','Move-LegacyProfileFolder')) {
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}, $true)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
@@ -70,7 +70,7 @@ try {
     $logged = Get-Content -LiteralPath $script:LogPath -Raw -ErrorAction SilentlyContinue
     Assert ($logged -match "Left profile 'Blocked'.*already holds files") 'Skipped move not logged'
     Assert ($logged -notmatch "'Running'") 'Open profile logged as a failure'
-    Assert ((Test-Path (Join-Path (& $new 'Personal') 'config.json')) -and -not (Test-Path (& $old 'Personal'))) 'Profile not moved'
+    Assert ((Test-Path (Join-Path (& $new 'Personal') 'config.json')) -and (Test-Junction (& $old 'Personal'))) 'Profile not moved, or no junction left at the old place'
     Assert (Test-Path (Join-Path $cache 'Local\ClaudeProfile-Personal\claude-code-sessions')) 'Store-redirected files not moved along'
     Assert ($logged -notmatch "'Personal'") 'Successful move logged'
     Assert (Test-Path (Join-Path (& $new 'Stranded') 'config.json')) 'Profile not moved when its Store-redirected part could not be'
@@ -78,14 +78,22 @@ try {
     Assert ($logged -match "Left part of profile 'Stranded'.*already exists") 'Store-redirected part left behind without a log line'
     Assert (Test-Path (Join-Path (& $old 'Running') 'config.json')) 'Running profile moved'
     Assert ((Test-Path (Join-Path (& $old 'Blocked') 'config.json')) -and (Test-Path (Join-Path (& $new 'Blocked') 'keep.txt'))) 'Non-empty target overwritten'
-    Assert ((Test-Path (Join-Path (& $new 'Busy') 'config.json')) -and -not (Test-Path (& $old 'Busy'))) 'Empty leftover target not replaced'
+    Assert ((Test-Path (Join-Path (& $new 'Busy') 'config.json')) -and (Test-Junction (& $old 'Busy'))) 'Empty leftover target not replaced'
     Assert (Test-Path (Join-Path $script:ProfileRoot '.switcher')) 'Switcher folder moved'
     Assert ((Get-ProfilePath -Id 'Running') -eq (& $old 'Running')) 'Running profile not found where it stayed'
     $script:Running = @{}
     Move-LegacyProfileFolder
-    Assert ((Test-Path (Join-Path (& $new 'Running') 'config.json')) -and -not (Test-Path (& $old 'Running'))) 'Profile not moved once it stopped'
+    Assert ((Test-Path (Join-Path (& $new 'Running') 'config.json')) -and (Test-Junction (& $old 'Running'))) 'Profile not moved once it stopped'
 
-    Write-Output 'PASS: profiles directly under LOCALAPPDATA, old place still found, empty leftover ignored, listing, taken names, one-time move (running, non-empty and empty targets, Store redirect, skipped moves logged).'
+    # The junction keeps old absolute paths resolving, and is never taken for a profile.
+    [IO.File]::WriteAllText((Join-Path (& $new 'Personal') 'marker.txt'), 'x')
+    Assert (Test-Path (Join-Path (& $old 'Personal') 'marker.txt')) 'Old path does not resolve to the moved profile'
+    Assert ((Get-ProfilePath -Id 'Personal') -eq (& $new 'Personal')) 'Junction chosen over the moved profile'
+    Assert ((@(Get-ProfileList -SkipStatus | Where-Object { $_.Id -eq 'Personal' })).Count -eq 1) 'Junction listed as a second profile'
+    Move-LegacyProfileFolder
+    Assert ((Test-Path (Join-Path (& $new 'Personal') 'config.json')) -and (Test-Junction (& $old 'Personal'))) 'Junction treated as a profile to move'
+
+    Write-Output 'PASS: profiles directly under LOCALAPPDATA, old place still found, empty leftover ignored, listing, taken names, one-time move (junction left at the old place, running, non-empty and empty targets, Store redirect, skipped moves logged).'
 } finally {
     $env:LOCALAPPDATA = $originalLocal
     $resolved = [IO.Path]::GetFullPath($fixture)
