@@ -41,11 +41,26 @@
     Create a new profile and open Claude at its sign-in screen. Used by the
     "Claude - Add account" Start menu shortcut.
 
+.PARAMETER RouteSignIns
+    Turn on sign-in routing: make the switcher the handler for claude:// links, so a
+    browser sign-in comes back to the account that asked for it instead of Default.
+
+.PARAMETER Status
+    Print the state of sign-in routing and of each open account, then exit.
+
+.PARAMETER Revert
+    Turn sign-in routing off and put the original claude:// handler back.
+
+.PARAMETER HandleLink
+    Used by Windows once sign-in routing is on: the claude:// link to forward. Not meant
+    to be typed, and refused when combined with any other parameter.
+
 .EXAMPLE
     .\ClaudeSwitcher.ps1
     .\ClaudeSwitcher.ps1 -Launch Work
     .\ClaudeSwitcher.ps1 -Shortcut Work
     .\ClaudeSwitcher.ps1 -AddAccount
+    .\ClaudeSwitcher.ps1 -RouteSignIns
 #>
 
 # Note for anyone editing this: PowerShell variable names are case-insensitive and
@@ -61,7 +76,11 @@ param(
     [switch]$Install,
     [string]$ClaudePath,
     [switch]$Tray,
-    [switch]$AddAccount
+    [switch]$AddAccount,
+    [switch]$RouteSignIns,
+    [switch]$Status,
+    [switch]$Revert,
+    [string]$HandleLink
 )
 
 $ErrorActionPreference = 'Stop'
@@ -101,6 +120,26 @@ $script:InstalledScript = Join-Path $script:SwitcherHome 'ClaudeSwitcher.ps1'
 $script:SettingsPath    = Join-Path $script:ProfileRoot 'settings.json'
 $script:DefaultName     = 'Default'
 $script:ScriptPath      = $MyInvocation.MyCommand.Path
+$script:RouterLogPath   = Join-Path $script:SwitcherHome 'sign-in-router.log'
+
+function Test-HandleLinkAlone {
+    # -HandleLink carries a link from the browser, and Windows hands a quote inside it to
+    # this script as separate arguments, so a crafted link can bring parameters of its own.
+    # With -HandleLink, nothing else may be bound.
+    param([Collections.IDictionary]$Bound)
+    return ($Bound.Keys -notcontains 'HandleLink') -or ($Bound.Count -eq 1)
+}
+
+# Checked before any parameter is acted on: -ClaudePath, for one, is saved to settings.json
+# further down, and every later run would launch it. Write-RouterLog is not defined yet,
+# hence the direct write.
+if (-not (Test-HandleLinkAlone -Bound $PSBoundParameters)) {
+    try {
+        New-Item -ItemType Directory -Force -Path $script:SwitcherHome | Out-Null
+        Add-Content -LiteralPath $script:RouterLogPath -Value ('[{0}] Refused: -HandleLink arrived together with other parameters.' -f (Get-Date -Format 's'))
+    } catch { }
+    return
+}
 
 function Get-Setting {
     param([Parameter(Mandatory)][string]$Name)
@@ -231,7 +270,7 @@ function Update-ClaudeInstall {
     $script:DefaultProfilePath = $script:ClaudeApp.DefaultProfilePath
 }
 
-Update-ClaudeInstall -AllowCache:([bool]$Launch)
+Update-ClaudeInstall -AllowCache:([bool]$Launch -or [bool]$HandleLink)
 if ($ClaudePath) { Set-Setting 'ClaudePath' $script:ClaudeApp.Exe }
 
 # ------------------------------------------------------------------- native --
@@ -249,6 +288,13 @@ function Initialize-Native {
 [DllImport("user32.dll")]   public static extern bool DestroyIcon(IntPtr hIcon);
 [DllImport("user32.dll", CharSet = CharSet.Unicode)]
 public static extern uint PrivateExtractIcons(string file, int index, int cx, int cy, IntPtr[] icons, uint[] ids, uint count, uint flags);
+[DllImport("user32.dll")]   public static extern IntPtr GetTopWindow(IntPtr hWnd);
+[DllImport("user32.dll")]   public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+[DllImport("user32.dll")]   public static extern bool IsWindowVisible(IntPtr hWnd);
+[DllImport("user32.dll")]   public static extern int GetWindowTextLength(IntPtr hWnd);
+[DllImport("user32.dll")]   public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+[DllImport("shlwapi.dll", CharSet = CharSet.Unicode)]
+public static extern int AssocQueryString(int flags, int str, string assoc, string extra, System.Text.StringBuilder result, ref uint size);
 '@
 }
 
@@ -463,9 +509,22 @@ function Start-ClaudeProfile {
     if (-not (Test-Path -LiteralPath $path)) {
         New-Item -ItemType Directory -Path $path -Force | Out-Null
     }
+    if (Test-SignInRoutingOn) {
+        try { Update-SignInRouting -Id $Id } catch { Write-RouterLog "Could not prepare sign-in routing: $($_.Exception.Message)" }
+    }
+    # The taskbar takes a custom group's icon from the Start menu shortcut carrying the
+    # same identity, and shows Claude's plain icon without one. Made before Claude starts,
+    # so it is there when the button is created. Cosmetic, so a failure is ignored.
+    $startMenu = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'
+    $target = Resolve-ClaudeProfile -Name $Id -SkipStatus
+    $script:ShortcutJustCreated = $false
+    if ($target -and -not (Test-Path -LiteralPath (Join-Path $startMenu "Claude - $($target.Name).lnk"))) {
+        try { New-ProfileShortcut -Target $target -Directory $startMenu | Out-Null; $script:ShortcutJustCreated = $true } catch { }
+    }
     # -WindowStyle Normal matters: shortcuts run us without a window, and without an
     # explicit show state Claude would inherit ours and start with an invisible window.
-    Start-Process -FilePath $script:ClaudeExe -ArgumentList "--user-data-dir=`"$path`"" -WindowStyle Normal
+    # The process is kept so its window can be given the profile's taskbar identity.
+    $script:LaunchedProcess = Start-Process -FilePath $script:ClaudeExe -ArgumentList "--user-data-dir=`"$path`"" -WindowStyle Normal -PassThru
     return $(if ($open) { 'focused' } else { 'started' })
 }
 
@@ -599,6 +658,352 @@ function Get-ProfileIconPath {
     return $file
 }
 
+# --------------------------------------------------------- taskbar identity --
+
+<#
+    Windows groups taskbar buttons by an AppUserModelID, and every Claude window carries the
+    same one, so all accounts pile onto one button with one icon. Each extra profile's
+    window is given an identity of its own, together with its badged icon, so it gets its
+    own button. Default is never touched: it keeps Claude's identity, so a pinned Claude
+    icon still matches it.
+
+    The identity is read when the taskbar button is created, so it is best set in the
+    moment between Electron creating the window and showing it. A window that is already
+    showing has its button rebuilt instead.
+
+    Windows reads a group's icon once per identity and never again. The badge letter is
+    therefore part of the identity: a rename that changes the letter moves the window to a
+    new identity, which brings the new icon with it. A profile's colour never changes.
+
+    Original idea and window identity code by Sukarth (Sukarth/Claude-Code-Desktop-Switcher).
+#>
+
+$script:TaskbarIdentitySource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace ClaudeSwitcher
+{
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    public struct PropertyKey
+    {
+        public Guid FormatId; public uint PropertyId;
+        public PropertyKey(Guid formatId, uint propertyId) { FormatId = formatId; PropertyId = propertyId; }
+    }
+
+    [ComImport, Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPropertyStore
+    {
+        int GetCount(out uint count);
+        int GetAt(uint index, out PropertyKey key);
+        int GetValue(ref PropertyKey key, IntPtr value);
+        int SetValue(ref PropertyKey key, IntPtr value);
+        int Commit();
+    }
+
+    [ComImport, Guid("0000010b-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPersistFile
+    {
+        int GetClassID(out Guid classId);
+        int IsDirty();
+        int Load([MarshalAs(UnmanagedType.LPWStr)] string fileName, uint mode);
+        int Save([MarshalAs(UnmanagedType.LPWStr)] string fileName, bool remember);
+        int SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string fileName);
+        int GetCurFile(out IntPtr fileName);
+    }
+
+    [ComImport, Guid("56FDF342-FD6D-11d0-958A-006097C9A090"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface ITaskbarList
+    {
+        int HrInit(); int AddTab(IntPtr hwnd); int DeleteTab(IntPtr hwnd);
+        int ActivateTab(IntPtr hwnd); int SetActiveAlt(IntPtr hwnd);
+    }
+
+    [ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090")] public class TaskbarListClass { }
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")] public class ShellLinkClass { }
+
+    public static class TaskbarIdentity
+    {
+        static readonly Guid AppUserModel = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
+        const uint PidRelaunchCommand = 2, PidRelaunchIcon = 3, PidRelaunchName = 4, PidId = 5;
+        const short VT_LPWSTR = 31;
+        const uint WM_SETICON = 0x0080, WM_GETICON = 0x007F, GW_OWNER = 4;
+        const int GWL_EXSTYLE = -20;
+        const long WS_EX_TOOLWINDOW = 0x80L;
+
+        delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int size);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")] static extern IntPtr GetWindowLongPtr64(IntPtr hwnd, int index);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLong")] static extern int GetWindowLong32(IntPtr hwnd, int index);
+        [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("shell32.dll", PreserveSig = false)]
+        static extern void SHGetPropertyStoreForWindow(IntPtr hwnd, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out IPropertyStore store);
+        [DllImport("ole32.dll")] static extern int PropVariantClear(IntPtr value);
+
+        static long ExStyle(IntPtr hwnd)
+        {
+            return IntPtr.Size == 8 ? GetWindowLongPtr64(hwnd, GWL_EXSTYLE).ToInt64() : (long)GetWindowLong32(hwnd, GWL_EXSTYLE);
+        }
+
+        static string ClassOf(IntPtr hwnd)
+        {
+            var name = new StringBuilder(64); GetClassName(hwnd, name, name.Capacity); return name.ToString();
+        }
+
+        /// Top-level Electron windows of a process that can have a taskbar button. Hidden
+        /// ones are included on request: that is the moment to set an identity.
+        public static IntPtr[] WindowsForPid(uint pid, bool includeHidden)
+        {
+            var found = new List<IntPtr>();
+            EnumWindows(delegate(IntPtr hwnd, IntPtr lParam)
+            {
+                uint owner; GetWindowThreadProcessId(hwnd, out owner);
+                if (owner != pid) return true;
+                if (!includeHidden && !IsWindowVisible(hwnd)) return true;
+                if (GetWindow(hwnd, GW_OWNER) != IntPtr.Zero) return true;
+                if ((ExStyle(hwnd) & WS_EX_TOOLWINDOW) != 0) return true;
+                if (ClassOf(hwnd) != "Chrome_WidgetWin_1") return true;
+                found.Add(hwnd);
+                return true;
+            }, IntPtr.Zero);
+            return found.ToArray();
+        }
+
+        public static bool IsVisible(IntPtr hwnd) { return IsWindowVisible(hwnd); }
+
+        // A PROPVARIANT built by hand, because InitPropVariantFromString is an inline SDK
+        // helper rather than an export: vt at offset 0, the string pointer at offset 8.
+        static void SetString(IPropertyStore store, uint propertyId, string value)
+        {
+            var key = new PropertyKey(AppUserModel, propertyId);
+            IntPtr pv = Marshal.AllocCoTaskMem(32);
+            for (int i = 0; i < 32; i++) Marshal.WriteByte(pv, i, 0);
+            try
+            {
+                Marshal.WriteInt16(pv, 0, VT_LPWSTR);
+                Marshal.WriteIntPtr(pv, 8, Marshal.StringToCoTaskMemUni(value));   // freed by PropVariantClear
+                Marshal.ThrowExceptionForHR(store.SetValue(ref key, pv));
+            }
+            finally { PropVariantClear(pv); Marshal.FreeCoTaskMem(pv); }
+        }
+
+        static string GetString(IPropertyStore store, uint propertyId)
+        {
+            var key = new PropertyKey(AppUserModel, propertyId);
+            IntPtr pv = Marshal.AllocCoTaskMem(32);
+            for (int i = 0; i < 32; i++) Marshal.WriteByte(pv, i, 0);
+            try
+            {
+                if (store.GetValue(ref key, pv) != 0) return null;
+                if (Marshal.ReadInt16(pv, 0) != VT_LPWSTR) return null;
+                return Marshal.PtrToStringUni(Marshal.ReadIntPtr(pv, 8));
+            }
+            finally { PropVariantClear(pv); Marshal.FreeCoTaskMem(pv); }
+        }
+
+        public static void SetWindowIdentity(IntPtr hwnd, string id, string relaunchCommand, string displayName, string iconResource)
+        {
+            Guid iid = typeof(IPropertyStore).GUID; IPropertyStore store;
+            SHGetPropertyStoreForWindow(hwnd, ref iid, out store);
+            try
+            {
+                SetString(store, PidId, id);
+                SetString(store, PidRelaunchCommand, relaunchCommand);
+                SetString(store, PidRelaunchName, displayName);
+                SetString(store, PidRelaunchIcon, iconResource);
+                Marshal.ThrowExceptionForHR(store.Commit());
+            }
+            finally { Marshal.ReleaseComObject(store); }
+        }
+
+        public static string GetWindowIdentity(IntPtr hwnd)
+        {
+            Guid iid = typeof(IPropertyStore).GUID; IPropertyStore store;
+            SHGetPropertyStoreForWindow(hwnd, ref iid, out store);
+            try { return GetString(store, PidId); }
+            finally { Marshal.ReleaseComObject(store); }
+        }
+
+        /// The identity of a .lnk, so a pinned copy of it shares a button with its window.
+        public static void SetShortcutIdentity(string path, string id)
+        {
+            object link = new ShellLinkClass();
+            try
+            {
+                var file = (IPersistFile)link;
+                Marshal.ThrowExceptionForHR(file.Load(path, 0x00000002));   // STGM_READWRITE
+                var store = (IPropertyStore)link;
+                SetString(store, PidId, id);
+                Marshal.ThrowExceptionForHR(store.Commit());
+                Marshal.ThrowExceptionForHR(file.Save(path, true));
+            }
+            finally { Marshal.ReleaseComObject(link); }
+        }
+
+        public static string GetShortcutIdentity(string path)
+        {
+            object link = new ShellLinkClass();
+            try
+            {
+                Marshal.ThrowExceptionForHR(((IPersistFile)link).Load(path, 0));   // STGM_READ
+                return GetString((IPropertyStore)link, PidId);
+            }
+            finally { Marshal.ReleaseComObject(link); }
+        }
+
+        /// Only for a visible window: AddTab on a hidden one would leave a phantom button.
+        public static void RebuildTaskbarButton(IntPtr hwnd)
+        {
+            var taskbar = (ITaskbarList)new TaskbarListClass();
+            try { taskbar.HrInit(); taskbar.DeleteTab(hwnd); taskbar.AddTab(hwnd); }
+            finally { Marshal.ReleaseComObject(taskbar); }
+        }
+
+        public static IntPtr GetIcon(IntPtr hwnd) { return SendMessage(hwnd, WM_GETICON, (IntPtr)1, IntPtr.Zero); }
+
+        public static void SetIcon(IntPtr hwnd, IntPtr icon)
+        {
+            SendMessage(hwnd, WM_SETICON, (IntPtr)0, icon);
+            SendMessage(hwnd, WM_SETICON, (IntPtr)1, icon);
+        }
+    }
+}
+'@
+
+# Compiled in memory, only on the paths that tag a window or a shortcut.
+function Initialize-TaskbarIdentity {
+    if ('ClaudeSwitcher.TaskbarIdentity' -as [type]) { return }
+    Add-Type -TypeDefinition $script:TaskbarIdentitySource
+}
+
+function Get-ProfileAumid {
+    # Unique per profile (the readable part loses spaces and symbols, the hash does not) and
+    # per badge letter. Letters only, digits and dots, well under the 128 character limit.
+    param([Parameter(Mandatory)]$Target)
+    $readable = ($Target.Id -replace '[^A-Za-z0-9]', '')
+    if ($readable.Length -gt 32) { $readable = $readable.Substring(0, 32) }
+    $sha  = [System.Security.Cryptography.SHA256]::Create()
+    $hash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Target.Id))).Replace('-', '').Substring(0, 10)
+    $sha.Dispose()
+    $letter = [int][char](Get-BadgeLetter -Label $Target.Name)
+    return 'ClaudeProfileSwitcher.Profile{0}.h{1}.b{2:x4}' -f $readable, $hash, $letter
+}
+
+function Get-ProfileRelaunchCommand {
+    # What a pinned taskbar button runs: the same launcher as the profile's shortcuts.
+    param([Parameter(Mandatory)]$Target)
+    $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+    $cmd     = "-NoProfile -ExecutionPolicy Bypass -File `"$(Get-LauncherScript)`" -Launch `"$($Target.Id)`""
+    if ([Environment]::OSVersion.Version.Build -ge 17763 -and (Test-Path -LiteralPath $conhost)) {
+        return "`"$conhost`" --headless `"$ps`" $cmd"
+    }
+    return "`"$ps`" -WindowStyle Hidden $cmd"
+}
+
+# Icon handles live as long as this process: a window draws with the handle it was given,
+# so it must not be freed while any window may still use it. One per profile and letter.
+$script:IdentityIcons = @{}
+
+function Get-ProfileIconHandle {
+    param([Parameter(Mandatory)]$Target)
+    # Loads System.Drawing, which Get-ProfileColor needs: -Launch reaches here before
+    # anything else in that process has loaded it.
+    Initialize-Native
+    $letter = Get-BadgeLetter -Label $Target.Name
+    $key = "$($Target.Id)|$letter"
+    if (-not $script:IdentityIcons.ContainsKey($key)) {
+        # 256 px: Windows 11 applies a smaller WM_SETICON icon to the window frame only
+        # and leaves the taskbar button as it was.
+        $bmp = New-BadgedBitmap -Size 256 -Letter $letter -Color (Get-ProfileColor -Id $Target.Id)
+        $script:IdentityIcons[$key] = $bmp.GetHicon()
+        $bmp.Dispose()
+    }
+    return $script:IdentityIcons[$key]
+}
+
+# Tags every window of one profile's process that lacks the profile's identity or icon.
+# Returns whether a visible window carries the identity now.
+function Update-ProfileWindowIdentity {
+    param([Parameter(Mandatory)]$Target, [Parameter(Mandatory)][int]$ProcessId)
+    if ($Target.IsDefault) { return $true }
+    Initialize-TaskbarIdentity
+    $want  = Get-ProfileAumid -Target $Target
+    $icon  = Get-ProfileIconHandle -Target $Target
+    $shown = $false
+    foreach ($hwnd in [ClaudeSwitcher.TaskbarIdentity]::WindowsForPid([uint32]$ProcessId, $true)) {
+        try {
+            if ([ClaudeSwitcher.TaskbarIdentity]::GetWindowIdentity($hwnd) -ne $want) {
+                [ClaudeSwitcher.TaskbarIdentity]::SetWindowIdentity($hwnd, $want, (Get-ProfileRelaunchCommand -Target $Target),
+                    "Claude - $($Target.Name)", "$(Get-ProfileIconPath -Target $Target),0")
+                [ClaudeSwitcher.TaskbarIdentity]::SetIcon($hwnd, $icon)
+                if ([ClaudeSwitcher.TaskbarIdentity]::IsVisible($hwnd)) { [ClaudeSwitcher.TaskbarIdentity]::RebuildTaskbarButton($hwnd) }
+            } elseif ([ClaudeSwitcher.TaskbarIdentity]::GetIcon($hwnd) -ne $icon) {
+                # Tagged by a shortcut's -Launch, which has exited since, and its icon handle
+                # with it. This process outlives that one, so it supplies the icon from now on.
+                [ClaudeSwitcher.TaskbarIdentity]::SetIcon($hwnd, $icon)
+            }
+            if ([ClaudeSwitcher.TaskbarIdentity]::IsVisible($hwnd)) { $shown = $true }
+        } catch { }
+    }
+    return $shown
+}
+
+function Update-RunningProfileIdentity {
+    foreach ($p in @(Get-ProfileList | Where-Object { $_.Pid -and -not $_.IsDefault })) {
+        try { Update-ProfileWindowIdentity -Target $p -ProcessId $p.Pid | Out-Null } catch { }
+    }
+}
+
+# Watches one launch for the window Claude is about to show. Polled every 150 ms by the
+# caller, so the window is usually tagged before its taskbar button exists.
+function New-IdentityWatch {
+    param([Parameter(Mandatory)]$Target, $Process, [int]$Seconds = 25)
+    return [pscustomobject]@{
+        Target     = $Target
+        Process    = $Process
+        ProcessId  = $(if ($Process) { $Process.Id } else { 0 })
+        Until      = (Get-Date).AddSeconds($Seconds)
+        NextLookup = [datetime]::MinValue
+        # Set when this launch created the Start menu shortcut: see Step-IdentityWatch.
+        Rebuild    = [bool]$script:ShortcutJustCreated
+        RebuildAt  = $null
+    }
+}
+
+# One poll. Returns $true when the watch is over: the window is tagged and showing, or
+# time ran out.
+function Step-IdentityWatch {
+    param([Parameter(Mandatory)]$Watch)
+    if ((Get-Date) -gt $Watch.Until) { return $true }
+    if ($Watch.Process -and $Watch.Process.HasExited) { $Watch.Process = $null; $Watch.ProcessId = 0 }
+    if (-not $Watch.ProcessId) {
+        # Handed to a copy that was already running, or started through a stub. Found by
+        # its profile folder instead, at most once a second since that asks WMI.
+        if ((Get-Date) -lt $Watch.NextLookup) { return $false }
+        $Watch.NextLookup = (Get-Date).AddSeconds(1)
+        $Watch.ProcessId  = [int]((Get-RunningProfileMap)[$Watch.Target.Path.TrimEnd('\')])
+        if (-not $Watch.ProcessId) { return $false }
+    }
+    $shown = Update-ProfileWindowIdentity -Target $Watch.Target -ProcessId $Watch.ProcessId
+    if (-not $shown -or -not $Watch.Rebuild) { return $shown }
+    # Windows indexes a new Start menu shortcut a few seconds after it is written, and a
+    # button created before that shows Claude's plain icon. Rebuilt once, a little later,
+    # it picks up the shortcut's badge.
+    if (-not $Watch.RebuildAt) { $Watch.RebuildAt = (Get-Date).AddSeconds(5); return $false }
+    if ((Get-Date) -lt $Watch.RebuildAt) { return $false }
+    foreach ($hwnd in [ClaudeSwitcher.TaskbarIdentity]::WindowsForPid([uint32]$Watch.ProcessId, $false)) {
+        try { [ClaudeSwitcher.TaskbarIdentity]::RebuildTaskbarButton($hwnd) } catch { }
+    }
+    return $true
+}
+
 # ---------------------------------------------------------------- shortcuts --
 
 function Get-ShortcutDirs {
@@ -657,6 +1062,14 @@ function New-ProfileShortcut {
     $link.WorkingDirectory = $script:SwitcherHome
     New-Item -ItemType Directory -Force -Path $script:SwitcherHome | Out-Null
     $link.Save()
+    if (-not $Target.IsDefault) {
+        # The window's identity, so a pinned copy of this shortcut shares its button
+        # instead of sitting beside it. Cosmetic, so a failure leaves a plain shortcut.
+        try {
+            Initialize-TaskbarIdentity
+            [ClaudeSwitcher.TaskbarIdentity]::SetShortcutIdentity($link.FullName, (Get-ProfileAumid -Target $Target))
+        } catch { }
+    }
     return $link.FullName
 }
 
@@ -921,10 +1334,527 @@ function Move-LegacyProfileFolder {
     }
 }
 
-# Cheap when there is nothing to move: one directory listing.
-try { Move-LegacyProfileFolder } catch { }
+# Cheap when there is nothing to move: one directory listing. Not from the sign-in handler:
+# Windows runs that for every claude:// link and it has to forward the link at once.
+# -Status only reports, so it must not change anything either.
+if (-not $PSBoundParameters.ContainsKey('HandleLink') -and -not $Status) {
+    try { Move-LegacyProfileFolder } catch { }
+}
+
+# --------------------------------------------------------- sign-in routing --
+
+<#
+    Signing in from a browser ends with a claude:// link, and Windows has one handler per
+    user for those, so without help every sign-in lands in Default. When the user turns
+    routing on, this script becomes that handler (-HandleLink) and forwards each sign-in
+    link to, in order:
+
+      1. the profile launched while signed out, which is expecting the sign-in
+      2. the one open profile that is signed out
+      3. the open profile whose window was most recently in front
+      4. Default, exactly as before
+
+    Every other claude:// link goes to Default untouched.
+
+    Two builds, two ways to become the handler:
+
+      Installer  - HKCU\Software\Classes\claude. Claude rewrites that key every time it
+                   starts, so the switcher takes it back whenever it notices.
+      Store      - the package manifest declares claude://, and Windows prefers it over
+                   that key. Only the user's choice in Settings > Default apps beats it,
+                   and Windows protects that choice with a hash nothing else can write.
+                   So the router is registered as an app the user can pick there, once.
+
+    Original idea and router by Sukarth (Sukarth/Claude-Code-Desktop-Switcher).
+#>
+
+$script:LinkScheme        = 'claude'
+$script:RouterProgId      = 'ClaudeProfileRouter.claude'
+$script:RouterAppName     = 'ClaudeProfileRouter'
+$script:RouterDisplayName = 'Claude Profile Router'
+$script:RouterRegistry    = [pscustomobject]@{
+    Classes    = 'HKCU:\Software\Classes'
+    Capability = 'HKCU:\Software\ClaudeProfileSwitcher\Capabilities'
+    AppList    = 'HKCU:\Software\RegisteredApplications'
+}
+$script:PendingSignInPath = Join-Path $script:SwitcherHome 'pending-sign-in.json'
+$script:HandlerBackupPath = Join-Path $script:SwitcherHome 'claude-handler-backup.json'
+# $script:RouterLogPath is set near the top, where a link arriving with other parameters is refused.
+
+function Test-SignInRoutingOn { return ((Get-Setting 'SignInRouting') -eq $true) }
+
+function Write-RouterLog {
+    param([string]$Message)
+    try {
+        New-Item -ItemType Directory -Force -Path (Split-Path $script:RouterLogPath -Parent) | Out-Null
+        # One line per sign-in, so this only grows large over years. Start over past 100 KB.
+        if ((Test-Path -LiteralPath $script:RouterLogPath) -and (Get-Item -LiteralPath $script:RouterLogPath).Length -gt 100KB) {
+            Remove-Item -LiteralPath $script:RouterLogPath -Force
+        }
+        Add-Content -LiteralPath $script:RouterLogPath -Value ('[{0}] {1}' -f (Get-Date -Format 's'), $Message)
+    } catch { }
+}
+
+function Test-SafeLink {
+    # The link arrives from the browser through the shell, so it is untrusted, and it ends
+    # up inside a command line for Claude.exe. Windows PowerShell 5.1 cannot pass an
+    # argument vector (ProcessStartInfo.ArgumentList is .NET Core only) and its own
+    # -ArgumentList array is joined without reliable quoting, so the link is validated
+    # instead: claude:// followed only by characters RFC 3986 permits in a URI. That
+    # excludes the quote, backslash, space and control characters an injection needs.
+    # Anchored with \z, not $: in .NET $ also matches before a trailing newline.
+    param([string]$Link)
+    if ([string]::IsNullOrEmpty($Link) -or $Link.Length -gt 2048) { return $false }
+    return ($Link -cmatch "^claude://[A-Za-z0-9._~:/?#\[\]@!\$&'()*+,;=%-]*\z")
+}
+
+function Test-SignInLink {
+    # Two shapes: claude://login/... on older builds, and claude://claude.ai/sso-callback?...
+    # on current ones (Store 2.7032). The boundary after sso-callback keeps a link such as
+    # claude://claude.ai/sso-callbackother from being taken for a sign-in.
+    param([string]$Link)
+    return ($Link -match '^claude://(login/|claude\.ai/sso-callback(?:[/?#]|\z))')
+}
+
+function Get-ProfileDataPath {
+    # Where Claude actually writes a profile's files. On the Store build, writes under
+    # %LOCALAPPDATA% are redirected into the package's LocalCache (see Get-CodeSessionRoot).
+    param([Parameter(Mandatory)]$Target)
+    $localPrefix = $env:LOCALAPPDATA.TrimEnd('\') + '\'
+    if ($script:ClaudeApp.Kind -eq 'Msix' -and -not $Target.IsDefault -and
+        $Target.Path.StartsWith($localPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        $cache = Split-Path (Split-Path $script:ClaudeApp.DefaultProfilePath -Parent) -Parent
+        $redirected = Join-Path (Join-Path $cache 'Local') $Target.Path.Substring($localPrefix.Length)
+        if (Test-Path -LiteralPath (Join-Path $redirected 'config.json')) { return $redirected }
+    }
+    return $Target.Path
+}
+
+function Test-ProfileSignedIn {
+    # $true or $false, or $null when there is no config.json to read yet. Observed on a
+    # real install: signing out flips windowSizeWasSignedIn to false and shrinks
+    # oauth:tokenCacheV2 to a 44 character placeholder (about 1400 to 2200 signed in).
+    # Only key presence and value length are looked at, never the token itself.
+    param([Parameter(Mandatory)][string]$Path)
+    $cfg = Join-Path $Path 'config.json'
+    if (-not (Test-Path -LiteralPath $cfg)) { return $null }
+    try {
+        $json  = Get-Content -LiteralPath $cfg -Raw -ErrorAction Stop | ConvertFrom-Json
+        $names = @($json.PSObject.Properties.Name)
+        if ($names -contains 'windowSizeWasSignedIn') { return [bool]$json.windowSizeWasSignedIn }
+        if ($names -contains 'oauth:tokenCacheV2') { return ([string]$json.'oauth:tokenCacheV2').Length -gt 100 }
+        return $false
+    } catch { return $null }
+}
+
+function Set-PendingSignIn {
+    param([Parameter(Mandatory)][string]$Id, [int]$Minutes = 15)
+    New-Item -ItemType Directory -Force -Path (Split-Path $script:PendingSignInPath -Parent) | Out-Null
+    @{ Profile = $Id; Expires = (Get-Date).AddMinutes($Minutes).ToString('o') } |
+        ConvertTo-Json | Set-Content -LiteralPath $script:PendingSignInPath -Encoding UTF8
+}
+
+function Clear-PendingSignIn { Remove-Item -LiteralPath $script:PendingSignInPath -Force -ErrorAction SilentlyContinue }
+
+function Get-PendingSignIn {
+    if (-not (Test-Path -LiteralPath $script:PendingSignInPath)) { return $null }
+    try {
+        $marker = Get-Content -LiteralPath $script:PendingSignInPath -Raw | ConvertFrom-Json
+        if ([datetime]$marker.Expires -lt (Get-Date)) { Clear-PendingSignIn; return $null }
+        return [string]$marker.Profile
+    } catch { Clear-PendingSignIn; return $null }
+}
+
+# Returns the profile a sign-in link belongs to and why, or $null to leave it to Default.
+function Select-SignInTarget {
+    param([object[]]$Profiles, [string]$PendingId, [int]$FrontmostPid)
+    if ($PendingId) {
+        $hit = @($Profiles | Where-Object { $_.Id -eq $PendingId -and -not $_.IsDefault }) | Select-Object -First 1
+        if ($hit) { return [pscustomobject]@{ Target = $hit; Reason = 'launched while signed out' } }
+    }
+    $open = @($Profiles | Where-Object { $_.Pid -and -not $_.IsDefault })
+    $signedOut = @($open | Where-Object { $_.SignedIn -eq $false })
+    if ($signedOut.Count -eq 1) { return [pscustomobject]@{ Target = $signedOut[0]; Reason = 'the only open account that is signed out' } }
+    if ($FrontmostPid) {
+        $hit = @($open | Where-Object { $_.Pid -eq $FrontmostPid }) | Select-Object -First 1
+        if ($hit) { return [pscustomobject]@{ Target = $hit; Reason = 'its window was used most recently' } }
+    }
+    return $null
+}
+
+function Get-FrontmostPid {
+    # Top-level windows are enumerated front to back, so the first visible, unowned, titled
+    # one belonging to these processes is the one used most recently. The browser is in
+    # front while the sign-in completes, which is why the foreground window cannot be used.
+    param([int[]]$ProcessIds)
+    if (-not $ProcessIds) { return 0 }
+    Initialize-Native
+    $hwnd = [Native.WinApi]::GetTopWindow([IntPtr]::Zero)
+    for ($i = 0; $i -lt 10000 -and $hwnd -ne [IntPtr]::Zero; $i++) {
+        if ([Native.WinApi]::IsWindowVisible($hwnd) -and
+            [Native.WinApi]::GetWindow($hwnd, 4) -eq [IntPtr]::Zero -and          # GW_OWNER
+            [Native.WinApi]::GetWindowTextLength($hwnd) -gt 0) {
+            $owner = [uint32]0
+            [Native.WinApi]::GetWindowThreadProcessId($hwnd, [ref]$owner) | Out-Null
+            if ($ProcessIds -contains [int]$owner) { return [int]$owner }
+        }
+        $hwnd = [Native.WinApi]::GetWindow($hwnd, 2)                                 # GW_HWNDNEXT
+    }
+    return 0
+}
+
+function Start-ClaudeWithLink {
+    # Only ever called with a link Test-SafeLink accepted, because it is embedded in a
+    # command line. If the profile is already open, Electron's single instance lock hands
+    # the link to that window instead of starting a second copy.
+    param([Parameter(Mandatory)][string]$Link, $Target)
+    if (-not (Test-Path -LiteralPath $script:ClaudeExe)) { Update-ClaudeInstall }
+    $argLine = $(if ($Target -and -not $Target.IsDefault) { "--user-data-dir=`"$($Target.Path)`" `"$Link`"" } else { "`"$Link`"" })
+    Start-Process -FilePath $script:ClaudeExe -ArgumentList $argLine -WindowStyle Normal
+}
+
+function Get-RouterCommand {
+    # Same launcher as the shortcuts: a headless console host, so nothing flashes on screen.
+    $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+    $cmd     = "-NoProfile -ExecutionPolicy Bypass -File `"$(Get-LauncherScript)`" -HandleLink `"%1`""
+    if ([Environment]::OSVersion.Version.Build -ge 17763 -and (Test-Path -LiteralPath $conhost)) {
+        return "`"$conhost`" --headless `"$ps`" $cmd"
+    }
+    return "`"$ps`" -WindowStyle Hidden $cmd"
+}
+
+function Get-RegistryDefault {
+    param([Parameter(Mandatory)][string]$Key)
+    return [string](Get-ItemProperty -LiteralPath $Key -ErrorAction SilentlyContinue).'(default)'
+}
+
+function Set-RegistryValue {
+    # Creates the key only when missing: New-Item -Force on an existing registry key
+    # replaces it, and that would wipe whatever else lives there.
+    param([Parameter(Mandatory)][string]$Key, [Parameter(Mandatory)][string]$Name, [string]$Value)
+    if (-not (Test-Path -LiteralPath $Key)) { New-Item -Path $Key -Force | Out-Null }
+    Set-ItemProperty -LiteralPath $Key -Name $Name -Value $Value
+}
+
+function Get-RouterRegistryPath {
+    $reg = $script:RouterRegistry
+    return [pscustomobject]@{
+        Scheme        = "$($reg.Classes)\$($script:LinkScheme)"
+        SchemeCommand = "$($reg.Classes)\$($script:LinkScheme)\shell\open\command"
+        ProgId        = "$($reg.Classes)\$($script:RouterProgId)"
+        ProgIdCommand = "$($reg.Classes)\$($script:RouterProgId)\shell\open\command"
+        Capability    = $reg.Capability
+        AppList       = $reg.AppList
+        # RegisteredApplications holds the capability path relative to the hive.
+        CapabilityRef = ($reg.Capability -replace '^HKCU:\\', '')
+    }
+}
+
+function Test-RouterRegistered {
+    # Both entries, pointing at the current copy of this script. Claude rewrites the first
+    # on every start; -Install moves the script. Either makes this false.
+    $keys = Get-RouterRegistryPath
+    $want = Get-RouterCommand
+    return ((Get-RegistryDefault $keys.SchemeCommand) -eq $want -and (Get-RegistryDefault $keys.ProgIdCommand) -eq $want)
+}
+
+function Register-SignInRouter {
+    $keys = Get-RouterRegistryPath
+    $cmd  = Get-RouterCommand
+    # Whatever Claude registered is saved once, before the first change, so -Revert can
+    # put it back exactly. A command of ours is never saved as the original. The claude
+    # key itself is saved too, with the two values registration sets (null when absent):
+    # the Store build can leave a bare key behind, with no command and only some of them.
+    if (-not (Test-Path -LiteralPath $script:HandlerBackupPath)) {
+        $existing = Get-RegistryDefault $keys.SchemeCommand
+        if ($existing -notlike '* -HandleLink *') {
+            $values = Get-ItemProperty -LiteralPath $keys.Scheme -ErrorAction SilentlyContinue
+            $names  = @(if ($values) { $values.PSObject.Properties.Name })
+            New-Item -ItemType Directory -Force -Path (Split-Path $script:HandlerBackupPath -Parent) | Out-Null
+            @{
+                Command     = $existing
+                KeyExisted  = (Test-Path -LiteralPath $keys.Scheme)
+                Description = $(if ($names -contains '(default)') { [string]$values.'(default)' } else { $null })
+                UrlProtocol = $(if ($names -contains 'URL Protocol') { [string]$values.'URL Protocol' } else { $null })
+            } | ConvertTo-Json | Set-Content -LiteralPath $script:HandlerBackupPath -Encoding UTF8
+        }
+    }
+    Set-RegistryValue $keys.Scheme '(default)' "URL:$($script:LinkScheme)"
+    Set-RegistryValue $keys.Scheme 'URL Protocol' ''
+    Set-RegistryValue $keys.SchemeCommand '(default)' $cmd
+
+    # The same command under a ProgID of our own, declared as an app that handles
+    # claude://, which is what lets the user pick it in Settings > Default apps.
+    Set-RegistryValue $keys.ProgId '(default)' "URL:$($script:LinkScheme)"
+    Set-RegistryValue $keys.ProgId 'URL Protocol' ''
+    Set-RegistryValue $keys.ProgIdCommand '(default)' $cmd
+    Set-RegistryValue "$($keys.ProgId)\Application" 'ApplicationName' $script:RouterDisplayName
+    Set-RegistryValue $keys.Capability 'ApplicationName' $script:RouterDisplayName
+    Set-RegistryValue $keys.Capability 'ApplicationDescription' 'Sends each Claude sign-in to the account that asked for it'
+    Set-RegistryValue "$($keys.Capability)\URLAssociations" $script:LinkScheme $script:RouterProgId
+    Set-RegistryValue $keys.AppList $script:RouterAppName $keys.CapabilityRef
+}
+
+function Get-LinkHandlerProgId {
+    # The ProgID Windows will really use for claude:// links. Asked of the shell rather than
+    # read from UserChoice: Windows ignores a choice whose protecting hash does not verify,
+    # and only the shell knows whether it does.
+    Initialize-Native
+    $size   = [uint32]260
+    $result = New-Object System.Text.StringBuilder 260
+    $hr = [Native.WinApi]::AssocQueryString(0x1000, 20, $script:LinkScheme, $null, $result, [ref]$size)   # ASSOCF_IS_PROTOCOL, ASSOCSTR_PROGID
+    if ($hr -ne 0) { return $null }
+    return $result.ToString()
+}
+
+function Test-RouterChosen {
+    # Whether claude:// links reach the router at all.
+    $progId = Get-LinkHandlerProgId
+    if ($progId -eq $script:RouterProgId) { return $true }
+    # The installer build has no manifest claim, so with no choice made the links follow
+    # the Classes key, which is ours while routing is on.
+    if ($script:ClaudeApp.Kind -ne 'Msix' -and (-not $progId -or $progId -eq $script:LinkScheme)) {
+        return (Test-RouterRegistered)
+    }
+    return $false
+}
+
+function Unregister-SignInRouter {
+    # Returns one line per thing done, for -Revert and the tray to report.
+    $keys = Get-RouterRegistryPath
+    $done = New-Object System.Collections.Generic.List[string]
+    $backup = $null
+    if (Test-Path -LiteralPath $script:HandlerBackupPath) {
+        try { $backup = Get-Content -LiteralPath $script:HandlerBackupPath -Raw | ConvertFrom-Json } catch { }
+    }
+    if ($backup -and $backup.Command) {
+        Set-RegistryValue $keys.SchemeCommand '(default)' $backup.Command
+        $done.Add('put back the claude:// handler Claude had registered')
+    } elseif ((Get-RegistryDefault $keys.SchemeCommand) -like '* -HandleLink *') {
+        # No command of Claude's to put back. Remove the whole key only when the backup
+        # says we created it; otherwise (or without a backup) keep the key and take out
+        # just the command we added.
+        if ($backup -and $backup.PSObject.Properties.Name -contains 'KeyExisted' -and -not $backup.KeyExisted) {
+            Remove-Item -LiteralPath $keys.Scheme -Recurse -Force
+        } else {
+            Remove-Item -LiteralPath $keys.SchemeCommand -Recurse -Force
+            foreach ($k in "$($keys.Scheme)\shell\open", "$($keys.Scheme)\shell") {
+                if ((Test-Path -LiteralPath $k) -and -not (Get-ChildItem -LiteralPath $k) -and -not (Get-Item -LiteralPath $k).Property) {
+                    Remove-Item -LiteralPath $k -Force
+                }
+            }
+        }
+        $done.Add('removed our claude:// handler; Claude registers its own the next time it starts')
+    }
+    # A key that was there before gets its own two values back, including their absence.
+    if ($backup -and $backup.KeyExisted -and (Test-Path -LiteralPath $keys.Scheme)) {
+        foreach ($pair in @(@('(default)', 'Description'), @('URL Protocol', 'UrlProtocol'))) {
+            if ($backup.PSObject.Properties.Name -notcontains $pair[1]) { continue }   # a backup from before this was saved
+            $value = $backup.($pair[1])
+            if ($null -ne $value) { Set-ItemProperty -LiteralPath $keys.Scheme -Name $pair[0] -Value $value; continue }
+            # Through .NET: Remove-ItemProperty cannot delete the default value, whose real
+            # name is empty; '(default)' is only how PowerShell displays it.
+            $sub = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(($keys.Scheme -replace '^HKCU:\\', ''), $true)
+            if ($sub) {
+                try { $sub.DeleteValue($(if ($pair[0] -eq '(default)') { '' } else { $pair[0] }), $false) } finally { $sub.Close() }
+            }
+        }
+    }
+    if (Test-Path -LiteralPath $script:HandlerBackupPath) { Remove-Item -LiteralPath $script:HandlerBackupPath -Force }
+
+    if ((Get-LinkHandlerProgId) -eq $script:RouterProgId) {
+        # Picked in Settings > Default apps, and only Settings can change that. Deleting the
+        # ProgID would leave claude:// pointing at nothing, so it stays. With routing off,
+        # -HandleLink passes every link straight to Default, and the next -Revert after
+        # Claude is picked again removes the rest.
+        $done.Add("kept '$($script:RouterDisplayName)': it is still your choice for claude:// links in Settings > Default apps. Links go straight to Default until you pick Claude there, then run -Revert again to remove it")
+        return $done
+    }
+    $removed = $false
+    if (Test-Path -LiteralPath $keys.ProgId) { Remove-Item -LiteralPath $keys.ProgId -Recurse -Force; $removed = $true }
+    if (Test-Path -LiteralPath $keys.Capability) {
+        Remove-Item -LiteralPath $keys.Capability -Recurse -Force; $removed = $true
+        $parent = Split-Path $keys.Capability -Parent
+        if ((Test-Path -LiteralPath $parent) -and -not (Get-ChildItem -LiteralPath $parent) -and
+            -not (Get-Item -LiteralPath $parent).Property) {
+            Remove-Item -LiteralPath $parent -Force
+        }
+    }
+    if ((Get-ItemProperty -LiteralPath $keys.AppList -ErrorAction SilentlyContinue).$($script:RouterAppName)) {
+        Remove-ItemProperty -LiteralPath $keys.AppList -Name $script:RouterAppName; $removed = $true
+    }
+    if ($removed) { $done.Add("removed '$($script:RouterDisplayName)' from the apps Windows offers for claude:// links") }
+    return $done
+}
+
+function Get-RouterStateText {
+    if (-not (Test-SignInRoutingOn)) { return 'off' }
+    if (-not (Test-RouterRegistered)) { return 'on, but Claude has the claude:// handler back (taken again at the next launch)' }
+    if (-not (Test-RouterChosen)) { return "on, waiting for one step: Settings > Default apps > $($script:RouterDisplayName) > set it for CLAUDE" }
+    return 'on: sign-ins go to the account that asked'
+}
+
+function Open-RouterDefaultAppsPage {
+    # Opens straight at the router's page on Windows 11 with the 2023-04 update or later,
+    # and at the Default apps list everywhere else.
+    Start-Process ('ms-settings:defaultapps?registeredAppUser=' + [uri]::EscapeDataString($script:RouterAppName))
+}
+
+# Returns $true when sign-ins now reach the router, $false while the Store build still
+# needs the user's pick in Settings.
+function Enable-SignInRouting {
+    Register-SignInRouter
+    Set-Setting 'SignInRouting' $true
+    Write-RouterLog 'Sign-in routing turned on.'
+    return (Test-RouterChosen)
+}
+
+function Disable-SignInRouting {
+    Set-Setting 'SignInRouting' $false
+    Clear-PendingSignIn
+    Write-RouterLog 'Sign-in routing turned off.'
+    # Passed straight through: capturing and returning nothing would hand callers a $null
+    # that @() counts as one item.
+    Unregister-SignInRouter
+}
+
+function Update-SignInRouting {
+    # Called as a profile launches while routing is on. A profile that is not signed in
+    # yet is about to be, so its sign-in is the one to expect.
+    param([Parameter(Mandatory)][string]$Id)
+    $target = [pscustomobject]@{ Id = $Id; Path = (Get-ProfilePath -Id $Id); IsDefault = ($Id -eq $script:DefaultName) }
+    if (-not $target.IsDefault -and (Test-ProfileSignedIn -Path (Get-ProfileDataPath -Target $target)) -ne $true) {
+        Set-PendingSignIn -Id $Id
+    }
+    if (-not (Test-RouterRegistered)) { Register-SignInRouter }
+}
+
+function Wait-RouterRetake {
+    # Claude rewrites the claude:// key a few seconds into starting. Shortcuts run without
+    # the tray's timer, so the launching process stays a little while to take it back.
+    param([int]$Seconds = 20)
+    $until = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $until) {
+        Start-Sleep -Seconds 1
+        if (-not (Test-RouterRegistered)) {
+            try { Register-SignInRouter; Write-RouterLog 'Took the claude:// handler back after Claude started.' } catch { }
+        }
+    }
+}
+
+function Request-SignInRouting {
+    # Asked once, the first time an account is added, because it changes a Windows setting
+    # outside the switcher's own folder. The answer is remembered either way; -Again asks
+    # regardless, for turning it on later from the tray.
+    param($Owner, [switch]$Again)
+    if (-not $Again -and $null -ne (Get-Setting 'SignInRouting')) { return }
+    Add-Type -AssemblyName System.Windows.Forms
+    $text = "Send browser sign-ins to the account that asked for them?`n`n" +
+            "Signing in to Claude finishes with a claude:// link, and Windows sends all of those to your original account. " +
+            "With this on, the switcher handles those links and passes each sign-in to the new account instead. Other links still go to your original account.`n`n" +
+            "This changes which program Windows uses for claude:// links. The original is saved, and turning it off from the tray menu (or -Revert) puts it back."
+    $answer = $(if ($Owner) { [System.Windows.Forms.MessageBox]::Show($Owner, $text, 'Sign-in routing', 'YesNo', 'Question') }
+                else        { [System.Windows.Forms.MessageBox]::Show($text, 'Sign-in routing', 'YesNo', 'Question') })
+    if ($answer -ne 'Yes') { Set-Setting 'SignInRouting' $false; return }
+    if (-not (Enable-SignInRouting)) { Show-RouterPickHint -Owner $Owner }
+}
+
+function Show-RouterPickHint {
+    param($Owner)
+    Add-Type -AssemblyName System.Windows.Forms
+    $text = "One more step, which only you can do: Windows lets the Store version of Claude keep claude:// links unless you choose otherwise.`n`n" +
+            "In the Settings page that opens next, set CLAUDE to '$($script:RouterDisplayName)', then sign in."
+    if ($Owner) { [System.Windows.Forms.MessageBox]::Show($Owner, $text, 'Sign-in routing', 'OK', 'Information') | Out-Null }
+    else        { [System.Windows.Forms.MessageBox]::Show($text, 'Sign-in routing', 'OK', 'Information') | Out-Null }
+    Open-RouterDefaultAppsPage
+}
+
+function Invoke-SignInRouter {
+    # Not Mandatory: an empty link must reach Test-SafeLink and be refused quietly, not
+    # stop at parameter binding with an error dialog.
+    param([string]$Link)
+    if (-not (Test-SafeLink -Link $Link)) {
+        # Refused rather than passed on: a link that fails is malformed or an attempt to
+        # smuggle extra arguments. Never logged, because a sign-in link carries a code.
+        Write-RouterLog 'Refused a claude:// link that failed validation.'
+        return
+    }
+    if (-not (Test-SignInRoutingOn) -or -not (Test-SignInLink -Link $Link)) {
+        Start-ClaudeWithLink -Link $Link
+        Write-RouterLog $(if (Test-SignInRoutingOn) { 'Not a sign-in link; passed to Default.' } else { 'Routing is off; passed a link to Default.' })
+        return
+    }
+    try {
+        $profiles = @(Get-ProfileList | ForEach-Object {
+            $signedIn = $(if ($_.Pid -and -not $_.IsDefault) { Test-ProfileSignedIn -Path (Get-ProfileDataPath -Target $_) } else { $null })
+            $_ | Add-Member -NotePropertyName SignedIn -NotePropertyValue $signedIn -PassThru
+        })
+        $front = Get-FrontmostPid -ProcessIds @($profiles | Where-Object { $_.Pid } | ForEach-Object { [int]$_.Pid })
+        $pick  = Select-SignInTarget -Profiles $profiles -PendingId (Get-PendingSignIn) -FrontmostPid $front
+        if ($pick) {
+            Start-ClaudeWithLink -Link $Link -Target $pick.Target
+            Write-RouterLog "Sign-in sent to '$($pick.Target.Name)' ($($pick.Reason))."
+        } else {
+            Start-ClaudeWithLink -Link $Link
+            Write-RouterLog 'Sign-in sent to Default (no other account was waiting for one).'
+        }
+        Clear-PendingSignIn
+    } catch {
+        # Losing the sign-in would be worse than sending it to the wrong account.
+        Write-RouterLog "Routing failed, sign-in passed to Default: $($_.Exception.Message)"
+        Start-ClaudeWithLink -Link $Link
+        return
+    }
+    # Claude may rewrite the claude:// key as the account starts; take it back so the next
+    # sign-in is routed too.
+    Start-Sleep -Seconds 4
+    try { if (-not (Test-RouterRegistered)) { Register-SignInRouter } } catch { }
+}
 
 # ------------------------------------------------------------ console modes --
+
+if ($PSBoundParameters.ContainsKey('HandleLink')) {
+    # Windows runs this for every claude:// link once routing is on. The link is untrusted:
+    # anything that rode along with it (-Revert, -ClaudePath, a stray positional argument)
+    # was refused at the top, before any parameter was acted on (Test-HandleLinkAlone). An
+    # empty link is refused by the router, never the window.
+    Invoke-SignInRouter -Link $HandleLink
+    return
+}
+
+if ($Status) {
+    $backup = $(if (Test-Path -LiteralPath $script:HandlerBackupPath) { $script:HandlerBackupPath } else { 'none' })
+    "Sign-in routing:  $(Get-RouterStateText)"
+    "Handler backup:   $backup"
+    "Pending sign-in:  $(if ($p = Get-PendingSignIn) { $p } else { 'none' })"
+    "Router log:       $($script:RouterLogPath)"
+    ''
+    'Open accounts:'
+    foreach ($p in @(Get-ProfileList | Where-Object { $_.Pid })) {
+        $signedIn = Test-ProfileSignedIn -Path (Get-ProfileDataPath -Target $p)
+        $state = $(if ($signedIn) { 'signed in' } elseif ($signedIn -eq $false) { 'signed out' } else { 'unknown' })
+        '  {0,-24} pid {1,-7} {2}' -f $p.Name, $p.Pid, $state
+    }
+    return
+}
+
+if ($Revert) {
+    $done = @(Disable-SignInRouting)
+    if ($done.Count) { $done } else { 'Nothing to put back: sign-in routing had not changed anything.' }
+    return
+}
+
+if ($RouteSignIns) {
+    if (Enable-SignInRouting) {
+        'Sign-in routing is on. Browser sign-ins now go to the account that asked for them.'
+    } else {
+        'Sign-in routing is on, with one step left that only you can do. In the Settings page'
+        "that just opened, set CLAUDE to '$($script:RouterDisplayName)'. Check with -Status."
+        Open-RouterDefaultAppsPage
+    }
+    return
+}
 
 if ($Install) {
     Install-Switcher
@@ -934,8 +1864,14 @@ if ($Install) {
 }
 
 if ($AddAccount) {
+    Request-SignInRouting
     $created = Add-ClaudeAccount
     "Added '$($created.Name)'. Sign in with the other account in the Claude window that just opened."
+    try {
+        $watch = New-IdentityWatch -Target $created -Process $script:LaunchedProcess
+        while (-not (Step-IdentityWatch -Watch $watch)) { Start-Sleep -Milliseconds 150 }
+    } catch { }
+    if (Test-SignInRoutingOn) { Wait-RouterRetake }
     return
 }
 
@@ -946,7 +1882,15 @@ if ($Launch) {
         $known = (Get-ProfileList -SkipStatus | ForEach-Object { $_.Name }) -join ', '
         throw "There is no Claude profile called '$Launch'.`r`n`r`nProfiles: $known"
     }
-    Start-ClaudeProfile -Id $target.Id | Out-Null
+    $how = Start-ClaudeProfile -Id $target.Id
+    if ($how -eq 'started' -and -not $target.IsDefault) {
+        # The window first: its identity has to be set before it is shown.
+        try {
+            $watch = New-IdentityWatch -Target $target -Process $script:LaunchedProcess
+            while (-not (Step-IdentityWatch -Watch $watch)) { Start-Sleep -Milliseconds 150 }
+        } catch { }
+        if (Test-SignInRoutingOn) { Wait-RouterRetake }
+    }
     return
 }
 
@@ -1073,13 +2017,13 @@ $emptyHint.Anchor    = 'Top,Left,Right'
 $emptyHint.Visible   = $false
 $listView.Controls.Add($emptyHint)
 
-$status           = New-Object System.Windows.Forms.Label
-$status.Font      = $fontSmall
-$status.ForeColor = $muted
-$status.Location  = New-Object System.Drawing.Point(21, 398)
-$status.Size      = New-Object System.Drawing.Size(500, 18)
-$status.Anchor    = 'Left,Right,Bottom'
-$form.Controls.Add($status)
+$statusLine           = New-Object System.Windows.Forms.Label
+$statusLine.Font      = $fontSmall
+$statusLine.ForeColor = $muted
+$statusLine.Location  = New-Object System.Drawing.Point(21, 398)
+$statusLine.Size      = New-Object System.Drawing.Size(500, 18)
+$statusLine.Anchor    = 'Left,Right,Bottom'
+$form.Controls.Add($statusLine)
 
 $chkTray           = New-Object System.Windows.Forms.CheckBox
 $chkTray.Text      = 'Keep running in the tray'
@@ -1192,7 +2136,7 @@ function Update-List {
     $label = $(if ($script:ClaudeApp.Version -eq 'unknown') { $script:ClaudeApp.Kind } else { $script:ClaudeApp.Version })
     # Kept deliberately ASCII only: without a BOM, Windows PowerShell 5.1 reads this file
     # using the system codepage, so non-ASCII here renders as garbage on other locales.
-    $status.Text = "$($profiles.Count) profile(s), $count running   |   Claude $label"
+    $statusLine.Text = "$($profiles.Count) profile(s), $count running   |   Claude $label"
     Update-Buttons
 }
 
@@ -1276,24 +2220,55 @@ function Invoke-LaunchProfile {
     param([Parameter(Mandatory)]$Target)
     try {
         $how = Start-ClaudeProfile -Id $Target.Id
+        if ($how -eq 'started') { Add-IdentityWatch -Target $Target }
         # The refresh timer flips the row to Running once the window is up.
-        $status.Text = $(if ($how -eq 'focused') { "Switched to '$($Target.Name)'." } else { "Starting '$($Target.Name)'..." })
+        $statusLine.Text = $(if ($how -eq 'focused') { "Switched to '$($Target.Name)'." } else { "Starting '$($Target.Name)'..." })
     } catch {
         Show-Message $_.Exception.Message 'Could not launch' 'OK' 'Error' | Out-Null
     }
 }
 
+$script:IdentityWatches = New-Object System.Collections.Generic.List[object]
+
+function Add-IdentityWatch {
+    param([Parameter(Mandatory)]$Target)
+    if ($Target.IsDefault) { return }
+    $script:IdentityWatches.Add((New-IdentityWatch -Target $Target -Process $script:LaunchedProcess))
+    $watchTimer.Start()
+}
+
 function Invoke-AddAccount {
     try {
+        Request-SignInRouting -Owner $(if ($form.Visible) { $form } else { $null })
         $created = Add-ClaudeAccount
     } catch {
         Show-Message $_.Exception.Message 'Could not add an account' 'OK' 'Error' | Out-Null
         return
     }
+    Add-IdentityWatch -Target $created
     $script:JustAdded = $created.Id
     Update-List -Force
     Select-ProfileRow -Id $created.Id
-    $status.Text = "Sign in to '$($created.Name)' in the new Claude window. Press F2 here to give it a better name."
+    $statusLine.Text = "Sign in to '$($created.Name)' in the new Claude window. Press F2 here to give it a better name."
+}
+
+function Switch-SignInRouting {
+    $owner = $(if ($form.Visible) { $form } else { $null })
+    try {
+        if (Test-SignInRoutingOn) {
+            $done = @(Disable-SignInRouting)
+            $msg  = 'Sign-in routing is off. Browser sign-ins go to your original account again.'
+            if ($done.Count) { $msg += "`n`n- " + ($done -join "`n- ") }
+            Show-Message $msg 'Sign-in routing' | Out-Null
+            return
+        }
+        Request-SignInRouting -Owner $owner -Again
+        if ((Test-SignInRoutingOn) -and (Test-RouterChosen)) {
+            Show-Message 'Sign-in routing is on. Browser sign-ins now go to the account that asked for them.' 'Sign-in routing' | Out-Null
+        }
+    } catch {
+        Show-Message $_.Exception.Message 'Sign-in routing' 'OK' 'Error' | Out-Null
+    }
 }
 
 function Invoke-RenameProfile {
@@ -1304,9 +2279,11 @@ function Invoke-RenameProfile {
     if (-not $answer -or -not $answer.Text -or $answer.Text -ceq $p.Name) { return }
     try {
         $renamed = Rename-ClaudeProfile -Target $p -NewName $answer.Text
+        # A new badge letter is a new identity and icon; an open window moves to it now.
+        try { Update-RunningProfileIdentity } catch { }
         Update-List -Force
         Select-ProfileRow -Id $renamed.Id
-        $status.Text = "Renamed '$($p.Name)' to '$($renamed.Name)'."
+        $statusLine.Text = "Renamed '$($p.Name)' to '$($renamed.Name)'."
     } catch {
         Show-Message $_.Exception.Message 'Could not rename' 'OK' 'Warning' | Out-Null
     }
@@ -1317,7 +2294,7 @@ function Invoke-AddShortcuts {
     if (-not $p) { return }
     try {
         foreach ($dir in Get-ShortcutDirs) { New-ProfileShortcut -Target $p -Directory $dir | Out-Null }
-        $status.Text = "Added 'Claude - $($p.Name)' to the desktop and Start menu."
+        $statusLine.Text = "Added 'Claude - $($p.Name)' to the desktop and Start menu."
     } catch {
         Show-Message $_.Exception.Message 'Could not create shortcut' 'OK' 'Error' | Out-Null
     }
@@ -1342,7 +2319,7 @@ function Invoke-DeleteProfile {
     try {
         Remove-ClaudeProfile -Target $p
         Update-List -Force
-        $status.Text = "Deleted '$($p.Name)'."
+        $statusLine.Text = "Deleted '$($p.Name)'."
     } catch {
         Show-Message $_.Exception.Message 'Could not delete' 'OK' 'Warning' | Out-Null
     }
@@ -1480,7 +2457,7 @@ function Show-TransferDialog {
 
     $msg = "Copied $copied chat(s) to '$($target.Name)'."
     if ($skipped) { $msg += " $skipped were already there." }
-    $status.Text = $msg
+    $statusLine.Text = $msg
     if ($copied -and -not $live) {
         if ((Show-Message "$msg`n`nOpen '$($target.Name)' now?" 'Chats copied' 'YesNo') -eq 'Yes') { Invoke-LaunchProfile -Target $target }
     } else {
@@ -1590,6 +2567,8 @@ $trayMenu.Add_Opening({
         else { New-SwitcherShortcut -Directory (Split-Path $lnk -Parent) -StartInTray | Out-Null }
     }
     $boot.Checked = (Test-Path -LiteralPath (Get-StartupShortcutPath))
+    $route = Add-MenuItem $trayMenu 'Send sign-ins to the right account' { Switch-SignInRouting }
+    $route.Checked = (Test-SignInRoutingOn)
     $trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
     $null = Add-MenuItem $trayMenu 'Exit' { Exit-Switcher }
     $_.Cancel = $false
@@ -1618,6 +2597,50 @@ $signalTimer = New-Object System.Windows.Forms.Timer
 $signalTimer.Interval = 250
 $signalTimer.Add_Tick({ if ($script:ShowSignal.WaitOne(0)) { Show-Switcher } })
 $signalTimer.Start()
+
+# Fast, for about 25 s after the switcher launches a profile, so the window is tagged
+# before it is shown and its taskbar button is created with the right identity.
+$watchTimer = New-Object System.Windows.Forms.Timer
+$watchTimer.Interval = 150
+$watchTimer.Add_Tick({
+    for ($i = $script:IdentityWatches.Count - 1; $i -ge 0; $i--) {
+        $finished = $true
+        try { $finished = Step-IdentityWatch -Watch $script:IdentityWatches[$i] } catch { }
+        if ($finished) { $script:IdentityWatches.RemoveAt($i) }
+    }
+    if ($script:IdentityWatches.Count -eq 0) { $watchTimer.Stop() }
+})
+
+# Slow, for profiles started some other way: a shortcut, or Claude restarting itself.
+# A full pass asks WMI, so it only runs while the set of Claude processes has changed in
+# the last 30 s. The first tick always counts as a change, which tags what is already open.
+$script:ClaudeProcessSet  = $null
+$script:IdentityPassUntil = [datetime]::MinValue
+$identityTimer = New-Object System.Windows.Forms.Timer
+$identityTimer.Interval = 4000
+$identityTimer.Add_Tick({
+    $now = (@(Get-Process -Name Claude -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }) | Sort-Object) -join ','
+    if ($now -ne $script:ClaudeProcessSet) { $script:ClaudeProcessSet = $now; $script:IdentityPassUntil = (Get-Date).AddSeconds(30) }
+    if ((Get-Date) -lt $script:IdentityPassUntil) { try { Update-RunningProfileIdentity } catch { } }
+})
+$identityTimer.Start()
+
+# Claude rewrites the claude:// key every time an account starts. Two registry reads per
+# tick; anything is written only when the handler has actually been lost.
+$routerTimer = New-Object System.Windows.Forms.Timer
+$routerTimer.Interval = 5000
+$routerTimer.Add_Tick({
+    if ((Test-SignInRoutingOn) -and -not (Test-RouterRegistered)) {
+        try { Register-SignInRouter; Write-RouterLog 'Took the claude:// handler back.' } catch { }
+    }
+})
+$routerTimer.Start()
+
+# Left behind by -Revert while the router was still the Default apps choice. Once the user
+# has picked something else, nothing points at it any more.
+if (-not (Test-SignInRoutingOn) -and (Test-Path -LiteralPath (Get-RouterRegistryPath).ProgId)) {
+    try { if ((Get-LinkHandlerProgId) -ne $script:RouterProgId) { Unregister-SignInRouter | Out-Null } } catch { }
+}
 
 $script:ExitRequested = $false
 $notify.Visible = $true
