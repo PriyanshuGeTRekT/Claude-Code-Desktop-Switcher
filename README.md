@@ -130,6 +130,24 @@ one account before picking it up in the other.
 > [open an issue](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/issues)
 > if a transferred chat does not show up or resume.
 
+### Environment variables per account
+
+To give one account's Claude its own environment variables (for example for an MCP
+server it runs), add `ProfileEnv` to `%LOCALAPPDATA%\ClaudeProfiles\settings.json`,
+keyed by the profile's folder name (the one `-List` shows in brackets, or its name when
+there are no brackets):
+
+```json
+"ProfileEnv": { "Work": { "MY_VAR": "value" } }
+```
+
+The switcher sets them only for the Claude it starts, then restores its own. They apply
+only when that account's Claude starts fresh: if it is already running, Electron hands
+the launch to the running copy, which keeps the environment it started with. Quit it
+from the tray first. On the Store build, `Default` opened from the switcher starts
+through the shell and does not get them. Names must be letters, digits and `_`, not
+starting with a digit; others are skipped.
+
 ## Command line
 
 | Command | Does |

@@ -483,6 +483,24 @@ function Show-ProfileWindow {
     return $true
 }
 
+# Runs $Action with the profile's ProfileEnv variables set in this process, so the Claude
+# it starts inherits them, then puts the previous values back (or removes them), so a
+# later launch of another profile from this process does not get them too.
+function Invoke-WithProfileEnv {
+    param([Parameter(Mandatory)][string]$Id, [Parameter(Mandatory)][scriptblock]$Action)
+    $saved = @{}
+    $vars  = (Get-Setting 'ProfileEnv').$Id
+    if ($vars) {
+        foreach ($p in $vars.PSObject.Properties) {
+            if ($p.Name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$' -or $saved.ContainsKey($p.Name)) { continue }
+            $saved[$p.Name] = [Environment]::GetEnvironmentVariable($p.Name, 'Process')
+            [Environment]::SetEnvironmentVariable($p.Name, [string]$p.Value, 'Process')
+        }
+    }
+    try { & $Action }
+    finally { foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n], 'Process') } }
+}
+
 # Returns 'focused' when the profile was already open, 'started' otherwise.
 function Start-ClaudeProfile {
     param([Parameter(Mandatory)][string]$Id)
@@ -501,7 +519,7 @@ function Start-ClaudeProfile {
             # Through the shell app model, so the instance keeps package identity.
             Start-Process 'explorer.exe' -ArgumentList "shell:AppsFolder\$($script:ClaudeApp.AppUserModelId)"
         } else {
-            Start-Process -FilePath $script:ClaudeExe -WindowStyle Normal
+            Invoke-WithProfileEnv -Id $Id { Start-Process -FilePath $script:ClaudeExe -WindowStyle Normal }
         }
         return $(if ($open) { 'focused' } else { 'started' })
     }
@@ -524,7 +542,7 @@ function Start-ClaudeProfile {
     # -WindowStyle Normal matters: shortcuts run us without a window, and without an
     # explicit show state Claude would inherit ours and start with an invisible window.
     # The process is kept so its window can be given the profile's taskbar identity.
-    $script:LaunchedProcess = Start-Process -FilePath $script:ClaudeExe -ArgumentList "--user-data-dir=`"$path`"" -WindowStyle Normal -PassThru
+    $script:LaunchedProcess = Invoke-WithProfileEnv -Id $Id { Start-Process -FilePath $script:ClaudeExe -ArgumentList "--user-data-dir=`"$path`"" -WindowStyle Normal -PassThru }
     return $(if ($open) { 'focused' } else { 'started' })
 }
 
@@ -1510,7 +1528,8 @@ function Start-ClaudeWithLink {
     param([Parameter(Mandatory)][string]$Link, $Target)
     if (-not (Test-Path -LiteralPath $script:ClaudeExe)) { Update-ClaudeInstall }
     $argLine = $(if ($Target -and -not $Target.IsDefault) { "--user-data-dir=`"$($Target.Path)`" `"$Link`"" } else { "`"$Link`"" })
-    Start-Process -FilePath $script:ClaudeExe -ArgumentList $argLine -WindowStyle Normal
+    $id = $(if ($Target) { $Target.Id } else { $script:DefaultName })
+    Invoke-WithProfileEnv -Id $id { Start-Process -FilePath $script:ClaudeExe -ArgumentList $argLine -WindowStyle Normal }
 }
 
 function Get-RouterCommand {
