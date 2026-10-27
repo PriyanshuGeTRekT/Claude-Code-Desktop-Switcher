@@ -61,6 +61,8 @@ Run the isolated regression tests with Windows PowerShell 5.1 and PowerShell 7:
     pwsh -NoProfile -File .\tests\SignInRouting.Tests.ps1
     powershell -NoProfile -File .\tests\TaskbarIdentity.Tests.ps1
     pwsh -NoProfile -File .\tests\TaskbarIdentity.Tests.ps1
+    powershell -NoProfile -File .\tests\ProfileLaunch.Tests.ps1
+    pwsh -NoProfile -File .\tests\ProfileLaunch.Tests.ps1
 
 These tests use temporary session stores and shortcuts, and never launch Claude or read
 real chats. The sign-in routing tests write only under a throwaway

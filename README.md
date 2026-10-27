@@ -94,7 +94,12 @@ turn this on or off later from the tray icon (**Send sign-ins to the right accou
 
 A sign-in goes to the first of these that applies: the account you launched while it was
 signed out, the only open account that is signed out, the open account whose window you used
-last, and otherwise `Default`. Every other `claude://` link still opens in `Default`.
+last, and otherwise `Default`.
+
+Every other `claude://` link, such as a link to a Claude Code session, still opens in
+`Default` unless you say otherwise. `-OpenLinksIn Work` sends all of them to `Work` from then
+on (`-OpenLinksIn Default` undoes it), and `-OpenLink <url> -Account Work` opens one link
+there, whether routing is on or not. `-Status` shows where other links go.
 
 > [!NOTE]
 > On the Store build, Windows keeps sending `claude://` links to Claude until you choose
@@ -130,7 +135,7 @@ one account before picking it up in the other.
 > [open an issue](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/issues)
 > if a transferred chat does not show up or resume.
 
-### Environment variables per account
+### Environment variables and launch flags per account
 
 To give one account's Claude its own environment variables (for example for an MCP
 server it runs), add `ProfileEnv` to `%LOCALAPPDATA%\ClaudeProfiles\settings.json`,
@@ -148,6 +153,19 @@ from the tray first. On the Store build, `Default` opened from the switcher star
 through the shell and does not get them. Names must be letters, digits and `_`, not
 starting with a digit; others are skipped.
 
+Extra command line flags for one account work the same way, under `ProfileArgs`, as one
+string or as a list:
+
+```json
+"ProfileArgs": { "Work": "--enable-logging --v=1" }
+"ProfileArgs": { "Personal": ["--lang", "fr-FR"] }
+```
+
+They go on every launch of that account, from the window, the tray, its shortcuts,
+`-Launch` and links, so existing shortcuts pick them up without being made again. The
+same two limits apply: a copy that is already open keeps the flags it started with, and
+`Default` on the Store build starts through the shell, which takes none.
+
 ## Command line
 
 | Command | Does |
@@ -164,6 +182,8 @@ starting with a digit; others are skipped.
 | `.\ClaudeSwitcher.ps1 -RouteSignIns` | Send browser sign-ins to the account that asked for them |
 | `.\ClaudeSwitcher.ps1 -Status` | Show whether sign-in routing is working, and which open accounts are signed in |
 | `.\ClaudeSwitcher.ps1 -Revert` | Turn sign-in routing off and put the original `claude://` handler back |
+| `.\ClaudeSwitcher.ps1 -OpenLink <url> -Account Work` | Open a `claude://` link in a chosen account |
+| `.\ClaudeSwitcher.ps1 -OpenLinksIn Work` | Send `claude://` links that are not sign-ins to that account from now on; `Default` undoes it |
 
 `-Launch` and `-Shortcut` accept either a profile's name or its folder name.
 
@@ -294,7 +314,8 @@ outside the switcher, its old shortcut will report that the profile no longer ex
   you unpin it and pin the renamed shortcut. Desktop and Start menu shortcuts are updated
   automatically; pinned ones cannot be.
 - `claude://` links open in the `Default` account, except sign-ins once
-  [sign-in routing](#signing-in-from-the-browser) is on.
+  [sign-in routing](#signing-in-from-the-browser) is on, and other links once you have
+  chosen an account for them with `-OpenLinksIn`.
 - Each running account is a full copy of the app, so budget roughly one Claude's worth of
   memory per account. A profile grows to a few hundred MB, mostly caches.
 - Each account that runs Cowork tasks locally starts its own Linux VM, which takes 4 GB of
