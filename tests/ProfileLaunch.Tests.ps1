@@ -36,16 +36,9 @@ $out = Invoke-WithProfileEnv -Id 'Work' {
 Assert ($out.Seen -eq 'work') 'Variable not set for the launch'
 Assert (-not $out.Bad -and -not $out.Digit) 'Invalid variable name set'
 Assert ([Environment]::GetEnvironmentVariable($var, 'Process') -eq 'preset') 'Preset value not restored'
-[Environment]::SetEnvironmentVariable($var, $null, 'Process')
+# Removed with a real null: PowerShell 7 turns $null into an empty value that stays.
+[Environment]::SetEnvironmentVariable($var, [NullString]::Value, 'Process')
 Invoke-WithProfileEnv -Id 'Work' { Assert ([Environment]::GetEnvironmentVariable($var, 'Process') -eq 'work') 'Variable not set when unset before' }
-$v = [Environment]::GetEnvironmentVariable($var, 'Process')
-Write-Output ("DIAG ps=" + $PSVersionTable.PSVersion + " after-unset-case: isnull=" + ($null -eq $v) + " value=[" + $v + "] len=" + $(if ($null -ne $v) { $v.Length } else { -1 }) + " envdrive=[" + (Get-Item "Env:$var" -ErrorAction SilentlyContinue).Value + "]")
-[Environment]::SetEnvironmentVariable('CSW_PROBE', 'x', 'Process'); [Environment]::SetEnvironmentVariable('CSW_PROBE', $null, 'Process')
-Write-Output ("DIAG probe: delete-with-null leaves isnull=" + ($null -eq [Environment]::GetEnvironmentVariable('CSW_PROBE', 'Process')))
-[Environment]::SetEnvironmentVariable('CSW_PROBE', 'x', 'Process'); [Environment]::SetEnvironmentVariable('CSW_PROBE', '', 'Process')
-Write-Output ("DIAG probe: delete-with-empty leaves isnull=" + ($null -eq [Environment]::GetEnvironmentVariable('CSW_PROBE', 'Process')))
-$h = @{}; $h['k'] = [Environment]::GetEnvironmentVariable('CSW_NEVER_SET_' + [guid]::NewGuid().ToString('N'), 'Process')
-Write-Output ("DIAG probe: hashtable keeps null key=" + $h.ContainsKey('k') + " isnull=" + ($null -eq $h['k']))
 Assert ($null -eq [Environment]::GetEnvironmentVariable($var, 'Process')) 'Unset variable not removed again'
 Invoke-WithProfileEnv -Id 'Other' { Assert ($null -eq [Environment]::GetEnvironmentVariable($var, 'Process')) 'Variable leaked to another profile' }
 try { Invoke-WithProfileEnv -Id 'Work' { throw 'launch failed' } } catch { }

@@ -513,7 +513,14 @@ function Invoke-WithProfileEnv {
         }
     }
     try { & $Action }
-    finally { foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n], 'Process') } }
+    finally {
+        foreach ($n in $saved.Keys) {
+            # A PowerShell $null reaches .NET as an empty string, which PowerShell 7 keeps as
+            # an empty variable instead of removing it. A real null removes it on both.
+            $previous = $(if ($null -eq $saved[$n]) { [NullString]::Value } else { $saved[$n] })
+            [Environment]::SetEnvironmentVariable($n, $previous, 'Process')
+        }
+    }
 }
 
 # Extra command line flags for one account, from settings.json:
