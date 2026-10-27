@@ -55,12 +55,24 @@
     Used by Windows once sign-in routing is on: the claude:// link to forward. Not meant
     to be typed, and refused when combined with any other parameter.
 
+.PARAMETER OpenLink
+    Open a claude:// link in a chosen account (-Account), or in the account OpenLinksIn
+    names, or in Default.
+
+.PARAMETER Account
+    The account -OpenLink opens the link in.
+
+.PARAMETER OpenLinksIn
+    Remember an account for claude:// links that are not sign-ins, once sign-in routing
+    brings them to the switcher. "Default" forgets it again.
+
 .EXAMPLE
     .\ClaudeSwitcher.ps1
     .\ClaudeSwitcher.ps1 -Launch Work
     .\ClaudeSwitcher.ps1 -Shortcut Work
     .\ClaudeSwitcher.ps1 -AddAccount
     .\ClaudeSwitcher.ps1 -RouteSignIns
+    .\ClaudeSwitcher.ps1 -OpenLink "claude://claude.ai/new" -Account Work
 #>
 
 # Note for anyone editing this: PowerShell variable names are case-insensitive and
@@ -80,7 +92,10 @@ param(
     [switch]$RouteSignIns,
     [switch]$Status,
     [switch]$Revert,
-    [string]$HandleLink
+    [string]$HandleLink,
+    [string]$OpenLink,
+    [string]$Account,
+    [string]$OpenLinksIn
 )
 
 $ErrorActionPreference = 'Stop'
@@ -270,7 +285,7 @@ function Update-ClaudeInstall {
     $script:DefaultProfilePath = $script:ClaudeApp.DefaultProfilePath
 }
 
-Update-ClaudeInstall -AllowCache:([bool]$Launch -or [bool]$HandleLink)
+Update-ClaudeInstall -AllowCache:([bool]$Launch -or [bool]$HandleLink -or [bool]$OpenLink)
 if ($ClaudePath) { Set-Setting 'ClaudePath' $script:ClaudeApp.Exe }
 
 # ------------------------------------------------------------------- native --
@@ -501,6 +516,35 @@ function Invoke-WithProfileEnv {
     finally { foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n], 'Process') } }
 }
 
+# Extra command line flags for one account, from settings.json:
+#   "ProfileArgs": { "<profile id>": "--flag --other=1" }
+#   "ProfileArgs": { "<profile id>": ["--flag", "a value with spaces"] }
+# A string is used as typed; array items are quoted when they need it. They go on every
+# launch of that account, so shortcuts pick them up without being made again. A line
+# break cannot be part of a command line, so it becomes a space.
+function Get-ProfileArgs {
+    param([Parameter(Mandatory)][string]$Id)
+    $raw = (Get-Setting 'ProfileArgs').$Id
+    if ($null -eq $raw) { return '' }
+    $items = @(if ($raw -is [string]) { $raw } else {
+        foreach ($i in $raw) { $v = [string]$i; if ($v -match '[\s"]') { '"' + ($v -replace '"', '\"') + '"' } else { $v } }
+    })
+    return (($items -join ' ') -replace '[\r\n]+', ' ').Trim()
+}
+
+# The command line for one launch of an account: its folder, its extra flags, then the
+# link, if any. Default on the Store build never comes here: it starts through the shell,
+# which takes no flags.
+function Get-LaunchArgLine {
+    param([Parameter(Mandatory)][string]$Id, [string]$Path, [string]$Link)
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($Path) { $parts.Add("--user-data-dir=`"$Path`"") }
+    $extra = Get-ProfileArgs -Id $Id
+    if ($extra) { $parts.Add($extra) }
+    if ($Link) { $parts.Add("`"$Link`"") }
+    return ($parts -join ' ')
+}
+
 # Returns 'focused' when the profile was already open, 'started' otherwise.
 function Start-ClaudeProfile {
     param([Parameter(Mandatory)][string]$Id)
@@ -519,7 +563,10 @@ function Start-ClaudeProfile {
             # Through the shell app model, so the instance keeps package identity.
             Start-Process 'explorer.exe' -ArgumentList "shell:AppsFolder\$($script:ClaudeApp.AppUserModelId)"
         } else {
-            Invoke-WithProfileEnv -Id $Id { Start-Process -FilePath $script:ClaudeExe -WindowStyle Normal }
+            $launch = @{ FilePath = $script:ClaudeExe; WindowStyle = 'Normal' }
+            $argLine = Get-LaunchArgLine -Id $Id
+            if ($argLine) { $launch.ArgumentList = $argLine }
+            Invoke-WithProfileEnv -Id $Id { Start-Process @launch }
         }
         return $(if ($open) { 'focused' } else { 'started' })
     }
@@ -542,7 +589,8 @@ function Start-ClaudeProfile {
     # -WindowStyle Normal matters: shortcuts run us without a window, and without an
     # explicit show state Claude would inherit ours and start with an invisible window.
     # The process is kept so its window can be given the profile's taskbar identity.
-    $script:LaunchedProcess = Invoke-WithProfileEnv -Id $Id { Start-Process -FilePath $script:ClaudeExe -ArgumentList "--user-data-dir=`"$path`"" -WindowStyle Normal -PassThru }
+    $argLine = Get-LaunchArgLine -Id $Id -Path $path
+    $script:LaunchedProcess = Invoke-WithProfileEnv -Id $Id { Start-Process -FilePath $script:ClaudeExe -ArgumentList $argLine -WindowStyle Normal -PassThru }
     return $(if ($open) { 'focused' } else { 'started' })
 }
 
@@ -1527,9 +1575,32 @@ function Start-ClaudeWithLink {
     # the link to that window instead of starting a second copy.
     param([Parameter(Mandatory)][string]$Link, $Target)
     if (-not (Test-Path -LiteralPath $script:ClaudeExe)) { Update-ClaudeInstall }
-    $argLine = $(if ($Target -and -not $Target.IsDefault) { "--user-data-dir=`"$($Target.Path)`" `"$Link`"" } else { "`"$Link`"" })
     $id = $(if ($Target) { $Target.Id } else { $script:DefaultName })
-    Invoke-WithProfileEnv -Id $id { Start-Process -FilePath $script:ClaudeExe -ArgumentList $argLine -WindowStyle Normal }
+    $argLine = Get-LaunchArgLine -Id $id -Path $(if ($Target -and -not $Target.IsDefault) { $Target.Path } else { '' }) -Link $Link
+    # Kept so a window started this way can be given the account's taskbar identity.
+    $script:LaunchedProcess = Invoke-WithProfileEnv -Id $id { Start-Process -FilePath $script:ClaudeExe -ArgumentList $argLine -WindowStyle Normal -PassThru }
+}
+
+# Where a claude:// link that is not a sign-in goes while routing is on: the account the
+# OpenLinksIn setting names, or Default ($null) when it is unset or no longer exists.
+function Get-OtherLinkTarget {
+    $id = [string](Get-Setting 'OpenLinksIn')
+    if (-not $id -or $id -eq $script:DefaultName) { return $null }
+    $target = Resolve-ClaudeProfile -Name $id -SkipStatus
+    if ($target -and $target.IsDefault) { return $null }
+    return $target
+}
+
+# After a link started an account's Claude: gives the new window the account's taskbar
+# identity, as -Launch does. Over almost at once when the window is already tagged, or
+# when the launch was handed to a copy that was already open.
+function Wait-LaunchedIdentity {
+    param([Parameter(Mandatory)]$Target)
+    if ($Target.IsDefault -or -not $script:LaunchedProcess) { return }
+    try {
+        $watch = New-IdentityWatch -Target $Target -Process $script:LaunchedProcess
+        while (-not (Step-IdentityWatch -Watch $watch)) { Start-Sleep -Milliseconds 150 }
+    } catch { }
 }
 
 function Get-RouterCommand {
@@ -1799,34 +1870,54 @@ function Invoke-SignInRouter {
         Write-RouterLog 'Refused a claude:// link that failed validation.'
         return
     }
-    if (-not (Test-SignInRoutingOn) -or -not (Test-SignInLink -Link $Link)) {
+    if (-not (Test-SignInRoutingOn)) {
         Start-ClaudeWithLink -Link $Link
-        Write-RouterLog $(if (Test-SignInRoutingOn) { 'Not a sign-in link; passed to Default.' } else { 'Routing is off; passed a link to Default.' })
+        Write-RouterLog 'Routing is off; passed a link to Default.'
         return
     }
-    try {
-        $profiles = @(Get-ProfileList | ForEach-Object {
-            $signedIn = $(if ($_.Pid -and -not $_.IsDefault) { Test-ProfileSignedIn -Path (Get-ProfileDataPath -Target $_) } else { $null })
-            $_ | Add-Member -NotePropertyName SignedIn -NotePropertyValue $signedIn -PassThru
-        })
-        $front = Get-FrontmostPid -ProcessIds @($profiles | Where-Object { $_.Pid } | ForEach-Object { [int]$_.Pid })
-        $pick  = Select-SignInTarget -Profiles $profiles -PendingId (Get-PendingSignIn) -FrontmostPid $front
-        if ($pick) {
-            Start-ClaudeWithLink -Link $Link -Target $pick.Target
-            Write-RouterLog "Sign-in sent to '$($pick.Target.Name)' ($($pick.Reason))."
-        } else {
+    if (-not (Test-SignInLink -Link $Link)) {
+        # Not a sign-in: the account OpenLinksIn names, otherwise Default as before.
+        $other = $null
+        try { $other = Get-OtherLinkTarget } catch { }
+        if (-not $other) {
             Start-ClaudeWithLink -Link $Link
-            Write-RouterLog 'Sign-in sent to Default (no other account was waiting for one).'
+            Write-RouterLog 'Not a sign-in link; passed to Default.'
+            return
         }
-        Clear-PendingSignIn
-    } catch {
-        # Losing the sign-in would be worse than sending it to the wrong account.
-        Write-RouterLog "Routing failed, sign-in passed to Default: $($_.Exception.Message)"
-        Start-ClaudeWithLink -Link $Link
-        return
+        try {
+            Start-ClaudeWithLink -Link $Link -Target $other
+            Write-RouterLog "Not a sign-in link; opened in '$($other.Name)' (OpenLinksIn)."
+            Wait-LaunchedIdentity -Target $other
+        } catch {
+            Write-RouterLog "Could not open a link in '$($other.Name)', passed to Default: $($_.Exception.Message)"
+            Start-ClaudeWithLink -Link $Link
+            return
+        }
+    } else {
+        try {
+            $profiles = @(Get-ProfileList | ForEach-Object {
+                $signedIn = $(if ($_.Pid -and -not $_.IsDefault) { Test-ProfileSignedIn -Path (Get-ProfileDataPath -Target $_) } else { $null })
+                $_ | Add-Member -NotePropertyName SignedIn -NotePropertyValue $signedIn -PassThru
+            })
+            $front = Get-FrontmostPid -ProcessIds @($profiles | Where-Object { $_.Pid } | ForEach-Object { [int]$_.Pid })
+            $pick  = Select-SignInTarget -Profiles $profiles -PendingId (Get-PendingSignIn) -FrontmostPid $front
+            if ($pick) {
+                Start-ClaudeWithLink -Link $Link -Target $pick.Target
+                Write-RouterLog "Sign-in sent to '$($pick.Target.Name)' ($($pick.Reason))."
+            } else {
+                Start-ClaudeWithLink -Link $Link
+                Write-RouterLog 'Sign-in sent to Default (no other account was waiting for one).'
+            }
+            Clear-PendingSignIn
+        } catch {
+            # Losing the sign-in would be worse than sending it to the wrong account.
+            Write-RouterLog "Routing failed, sign-in passed to Default: $($_.Exception.Message)"
+            Start-ClaudeWithLink -Link $Link
+            return
+        }
     }
     # Claude may rewrite the claude:// key as the account starts; take it back so the next
-    # sign-in is routed too.
+    # link is routed too.
     Start-Sleep -Seconds 4
     try { if (-not (Test-RouterRegistered)) { Register-SignInRouter } } catch { }
 }
@@ -1842,11 +1933,59 @@ if ($PSBoundParameters.ContainsKey('HandleLink')) {
     return
 }
 
+if ($PSBoundParameters.ContainsKey('OpenLink')) {
+    # Typed by the user, unlike -HandleLink, but it ends up in Claude's command line all
+    # the same, so it passes the same check.
+    if (-not (Test-SafeLink -Link $OpenLink)) {
+        throw 'That is not a link the switcher can open: it must be claude:// followed by ordinary URL characters, up to 2048 of them.'
+    }
+    $target = $null
+    if ($Account) {
+        $target = Resolve-ClaudeProfile -Name $Account -SkipStatus
+        if (-not $target) {
+            $known = (Get-ProfileList -SkipStatus | ForEach-Object { $_.Name }) -join ', '
+            throw "There is no Claude profile called '$Account'.`r`n`r`nProfiles: $known"
+        }
+        if ($target.IsDefault) { $target = $null }
+    } else {
+        $target = Get-OtherLinkTarget
+    }
+    Start-ClaudeWithLink -Link $OpenLink -Target $target
+    "Opened the link in '$(if ($target) { $target.Name } else { $script:DefaultName })'."
+    if ($target) {
+        Wait-LaunchedIdentity -Target $target
+        if (Test-SignInRoutingOn) { Wait-RouterRetake }
+    }
+    return
+}
+
+if ($PSBoundParameters.ContainsKey('OpenLinksIn')) {
+    if (-not $OpenLinksIn -or $OpenLinksIn -eq $script:DefaultName) {
+        Set-Setting 'OpenLinksIn' $null
+        'claude:// links that are not sign-ins open in Default again.'
+        return
+    }
+    $target = Resolve-ClaudeProfile -Name $OpenLinksIn -SkipStatus
+    if (-not $target) {
+        $known = (Get-ProfileList -SkipStatus | ForEach-Object { $_.Name }) -join ', '
+        throw "There is no Claude profile called '$OpenLinksIn'.`r`n`r`nProfiles: $known"
+    }
+    Set-Setting 'OpenLinksIn' $target.Id
+    "claude:// links that are not sign-ins now open in '$($target.Name)'."
+    if (-not (Test-SignInRoutingOn)) {
+        'That takes effect once sign-in routing is on (-RouteSignIns): routing is what brings those links to the switcher.'
+    } elseif (-not (Test-RouterChosen)) {
+        "One step is still to do before links reach the switcher: $(Get-RouterStateText)"
+    }
+    return
+}
+
 if ($Status) {
     $backup = $(if (Test-Path -LiteralPath $script:HandlerBackupPath) { $script:HandlerBackupPath } else { 'none' })
     "Sign-in routing:  $(Get-RouterStateText)"
     "Handler backup:   $backup"
     "Pending sign-in:  $(if ($p = Get-PendingSignIn) { $p } else { 'none' })"
+    "Other links:      $(if ($o = Get-OtherLinkTarget) { "open in '$($o.Name)'" } else { 'open in Default' })"
     "Router log:       $($script:RouterLogPath)"
     ''
     'Open accounts:'
