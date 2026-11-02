@@ -543,6 +543,32 @@ function Invoke-WithProfileEnv {
     }
 }
 
+# "NAME=value" lines, as typed in the Edit dialog, to the map ProfileEnv stores. Lines
+# that are blank or start with # are skipped; the rest must have a valid name before the
+# first = and are reported back, not silently dropped.
+function ConvertFrom-EnvLines {
+    param([string]$Text)
+    $vars = [ordered]@{}
+    $invalid = @()
+    foreach ($line in @($Text -split "`r?`n")) {
+        $l = $line.Trim()
+        if (-not $l -or $l.StartsWith('#')) { continue }
+        $i = $l.IndexOf('=')
+        $name = $(if ($i -gt 0) { $l.Substring(0, $i).Trim() } else { '' })
+        if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { $invalid += $l; continue }
+        $vars[$name] = $l.Substring($i + 1)
+    }
+    return [pscustomobject]@{ Vars = $vars; Invalid = $invalid }
+}
+
+function ConvertTo-EnvLines {
+    param($Vars)
+    if (-not $Vars) { return '' }
+    $pairs = $(if ($Vars -is [System.Collections.IDictionary]) { $Vars.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" } }
+               else { $Vars.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" } })
+    return (@($pairs) -join "`r`n")
+}
+
 # Extra command line flags for one account, from settings.json:
 #   "ProfileArgs": { "<profile id>": "--flag --other=1" }
 #   "ProfileArgs": { "<profile id>": ["--flag", "a value with spaces"] }
@@ -682,27 +708,80 @@ function Stop-ClaudeProfile {
 # Shortcuts used to point their icon at Claude.exe itself. On the Store build that path
 # contains the version, so every update left them blank. These copies never move.
 
-function Get-ProfileColor {
+$script:Palette = @(
+    @(66, 133, 180), @(76, 150, 96), @(150, 96, 180), @(190, 80, 110),
+    @(60, 150, 150), @(90, 110, 200), @(200, 150, 50), @(80, 86, 100))
+
+function Get-PaletteColor {
+    param([Parameter(Mandatory)][int]$Index)
+    $rgb = $script:Palette[$Index % $script:Palette.Count]
+    return [System.Drawing.Color]::FromArgb($rgb[0], $rgb[1], $rgb[2])
+}
+
+# One setting's map of profile id to value, as a hashtable. Used for Colors, ChosenColors,
+# ProfileEnv and ProfileArgs, which all have that shape.
+function Get-ProfileMap {
+    param([Parameter(Mandatory)][string]$Setting)
+    $map = @{}
+    $raw = Get-Setting $Setting
+    if ($raw) { $raw.PSObject.Properties | ForEach-Object { $map[$_.Name] = $_.Value } }
+    return $map
+}
+
+function Set-ProfileMapEntry {
+    param([Parameter(Mandatory)][string]$Setting, [Parameter(Mandatory)][string]$Id, $Value)
+    $map = Get-ProfileMap -Setting $Setting
+    if ($null -eq $Value) { $map.Remove($Id) } else { $map[$Id] = $Value }
+    Set-Setting $Setting $map
+}
+
+# A colour the user picked in Edit, if any; otherwise -1. Kept apart from the automatic
+# assignment so an upgrade changes nobody's icon file names or taskbar identities.
+function Get-ProfileChosenColor {
     param([Parameter(Mandatory)][string]$Id)
-    $palette = @(
-        @(66, 133, 180), @(76, 150, 96), @(150, 96, 180), @(190, 80, 110),
-        @(60, 150, 150), @(90, 110, 200), @(200, 150, 50), @(80, 86, 100))
+    $chosen = Get-ProfileMap -Setting 'ChosenColors'
+    if ($chosen.ContainsKey($Id)) { return ([int]$chosen[$Id] % $script:Palette.Count) }
+    return -1
+}
+
+function Set-ProfileChosenColor {
+    param([Parameter(Mandatory)][string]$Id, [int]$Index)
+    Set-ProfileMapEntry -Setting 'ChosenColors' -Id $Id -Value ($Index % $script:Palette.Count)
+}
+
+function Get-ProfileColorIndex {
+    param([Parameter(Mandatory)][string]$Id)
+    $picked = Get-ProfileChosenColor -Id $Id
+    if ($picked -ge 0) { return $picked }
     # Assigned once and remembered: a hash of the name would regularly give two profiles
     # the same colour, and a colour that changes later would defeat the point.
     $assigned = @{}
-    $raw = Get-Setting 'Colors'
-    if ($raw) { $raw.PSObject.Properties | ForEach-Object { $assigned[$_.Name] = [int]$_.Value } }
+    foreach ($e in (Get-ProfileMap -Setting 'Colors').GetEnumerator()) { $assigned[$e.Key] = [int]$e.Value }
     if (-not $assigned.ContainsKey($Id)) {
         $alive = @(Get-ProfileList -SkipStatus | ForEach-Object { $_.Id })
-        $use = New-Object int[] $palette.Count
-        foreach ($k in @($assigned.Keys)) { if ($alive -contains $k) { $use[$assigned[$k] % $palette.Count]++ } }
+        $use = New-Object int[] $script:Palette.Count
+        foreach ($k in @($assigned.Keys)) { if ($alive -contains $k) { $use[$assigned[$k] % $script:Palette.Count]++ } }
         $pick = 0
-        for ($i = 1; $i -lt $palette.Count; $i++) { if ($use[$i] -lt $use[$pick]) { $pick = $i } }
+        for ($i = 1; $i -lt $script:Palette.Count; $i++) { if ($use[$i] -lt $use[$pick]) { $pick = $i } }
         $assigned[$Id] = $pick
         Set-Setting 'Colors' $assigned
     }
-    $rgb = $palette[$assigned[$Id] % $palette.Count]
-    return [System.Drawing.Color]::FromArgb($rgb[0], $rgb[1], $rgb[2])
+    return ($assigned[$Id] % $script:Palette.Count)
+}
+
+function Get-ProfileColor {
+    param([Parameter(Mandatory)][string]$Id)
+    return (Get-PaletteColor -Index (Get-ProfileColorIndex -Id $Id))
+}
+
+# The suffix a picked colour adds to the icon file name and the taskbar identity, so both
+# change with it (Explorer caches icons by path, Windows caches a button's icon per
+# identity). Nothing is added for the automatic colour.
+function Get-ProfileColorSuffix {
+    param([Parameter(Mandatory)][string]$Id)
+    $picked = Get-ProfileChosenColor -Id $Id
+    if ($picked -ge 0) { return "-c$picked" }
+    return ''
 }
 
 function Get-BadgeLetter {
@@ -791,12 +870,12 @@ function Get-ProfileIconPath {
     $letter = $(if ($Target.IsDefault) { '' } else { Get-BadgeLetter -Label $Target.Name })
     # The letter is part of the file name because Explorer caches icons by path, so
     # rewriting the same file after a rename would keep showing the old letter.
-    $base = $(if ($letter) { "$($Target.Id)-$letter" } else { $Target.Id })
+    $base = $(if ($letter) { "$($Target.Id)-$letter$(Get-ProfileColorSuffix -Id $Target.Id)" } else { $Target.Id })
     $file = Join-Path $script:IconDir "$base.ico"
     if ((Test-Path -LiteralPath $file) -and -not $Refresh) { return $file }
 
     New-Item -ItemType Directory -Force -Path $script:IconDir | Out-Null
-    $stale = '^' + [regex]::Escape($Target.Id) + '(-.)?$'
+    $stale = '^' + [regex]::Escape($Target.Id) + '(-.(-c\d+)?)?$'
     Get-ChildItem -LiteralPath $script:IconDir -Filter '*.ico' -ErrorAction SilentlyContinue |
         Where-Object { $_.BaseName -match $stale } | Remove-Item -Force -ErrorAction SilentlyContinue
 
@@ -1041,7 +1120,7 @@ function Get-ProfileAumid {
     $hash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Target.Id))).Replace('-', '').Substring(0, 10)
     $sha.Dispose()
     $letter = [int][char](Get-BadgeLetter -Label $Target.Name)
-    return 'ClaudeProfileSwitcher.Profile{0}.h{1}.b{2:x4}' -f $readable, $hash, $letter
+    return ('ClaudeProfileSwitcher.Profile{0}.h{1}.b{2:x4}' -f $readable, $hash, $letter) + (Get-ProfileColorSuffix -Id $Target.Id).Replace('-', '.')
 }
 
 function Get-ProfileRelaunchCommand {
@@ -1066,7 +1145,7 @@ function Get-ProfileIconHandle {
     # anything else in that process has loaded it.
     Initialize-Native
     $letter = Get-BadgeLetter -Label $Target.Name
-    $key = "$($Target.Id)|$letter"
+    $key = "$($Target.Id)|$letter$(Get-ProfileColorSuffix -Id $Target.Id)"
     if (-not $script:IdentityIcons.ContainsKey($key)) {
         # 256 px: Windows 11 applies a smaller WM_SETICON icon to the window frame only
         # and leaves the taskbar button as it was.
@@ -1309,10 +1388,11 @@ function Remove-ClaudeProfile {
     $link = Join-Path $script:ProfileRoot $Target.Id
     if (Test-Junction $link) { [IO.Directory]::Delete($link, $false) }
     Remove-ProfileShortcuts -Label $Target.Name | Out-Null
-    $stale = '^' + [regex]::Escape($Target.Id) + '(-.)?$'
+    $stale = '^' + [regex]::Escape($Target.Id) + '(-.(-c\d+)?)?$'
     Get-ChildItem -LiteralPath $script:IconDir -Filter '*.ico' -ErrorAction SilentlyContinue |
         Where-Object { $_.BaseName -match $stale } | Remove-Item -Force -ErrorAction SilentlyContinue
     Set-ProfileLabel -Id $Target.Id -Label $null
+    foreach ($setting in 'ChosenColors', 'ProfileEnv', 'ProfileArgs') { Set-ProfileMapEntry -Setting $setting -Id $Target.Id -Value $null }
 }
 
 function Install-Switcher {
@@ -2329,7 +2409,7 @@ function New-Button {
 
 $btnLaunch   = New-Button -Text 'Launch'          -X 20  -Width 100 -Primary
 $btnNew      = New-Button -Text 'Add account'     -X 128 -Width 104
-$btnRename   = New-Button -Text 'Rename'          -X 240 -Width 80
+$btnRename   = New-Button -Text 'Edit...'         -X 240 -Width 80
 $btnShortcut = New-Button -Text 'Shortcuts'       -X 328 -Width 92
 $btnTransfer = New-Button -Text 'Transfer chats'  -X 428 -Width 112
 $btnClose    = New-Button -Text 'Close'           -X 548 -Width 80
@@ -2340,6 +2420,7 @@ $tips.SetToolTip($btnNew, 'Opens Claude at a fresh sign-in screen for another ac
 $tips.SetToolTip($btnShortcut, 'Desktop and Start menu shortcuts that open this account directly')
 $tips.SetToolTip($btnTransfer, 'Copy Claude Code chats from this account to another one')
 $tips.SetToolTip($btnClose, "Close this account's Claude window and end its process")
+$tips.SetToolTip($btnRename, 'Name, badge colour, environment variables and launch flags (F2)')
 
 function Get-ProfileImageKey {
     param([Parameter(Mandatory)]$Target)
@@ -2519,7 +2600,7 @@ function Invoke-AddAccount {
     $script:JustAdded = $created.Id
     Update-List -Force
     Select-ProfileRow -Id $created.Id
-    $statusLine.Text = "Sign in to '$($created.Name)' in the new Claude window. Press F2 here to give it a better name."
+    $statusLine.Text = "Sign in to '$($created.Name)' in the new Claude window. Press F2 here to name it and pick its colour."
 }
 
 function Invoke-CloseProfile {
@@ -2566,21 +2647,145 @@ function Switch-SignInRouting {
     }
 }
 
-function Invoke-RenameProfile {
+# Name, badge colour, environment variables and launch flags for one account. Returns
+# what was entered, or $null on Cancel.
+function Show-EditDialog {
+    param([Parameter(Mandatory)]$Target)
+    $storeDefault = ($Target.IsDefault -and $script:ClaudeApp.Kind -eq 'Msix')
+    $dlg                 = New-Object System.Windows.Forms.Form
+    $dlg.Text            = "Edit '$($Target.Name)'"
+    $dlg.Size            = New-Object System.Drawing.Size(480, 468)
+    $dlg.StartPosition   = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+    $dlg.ShowInTaskbar   = $false
+    $dlg.BackColor       = $bg
+    $dlg.Font            = $fontUI
+
+    function Add-Label([string]$Text, [int]$Y, [switch]$Small) {
+        $l = New-Object System.Windows.Forms.Label
+        $l.Text = $Text; $l.Location = New-Object System.Drawing.Point(18, $Y)
+        $l.Size = New-Object System.Drawing.Size(430, 18); $l.ForeColor = $(if ($Small) { $muted } else { $ink })
+        if ($Small) { $l.Font = $fontSmall }
+        $dlg.Controls.Add($l)
+    }
+
+    Add-Label 'Name' 14
+    $name          = New-Object System.Windows.Forms.TextBox
+    $name.Location = New-Object System.Drawing.Point(18, 34)
+    $name.Size     = New-Object System.Drawing.Size(430, 26)
+    $name.Text     = $Target.Name
+    $dlg.Controls.Add($name)
+
+    Add-Label 'Badge colour' 72
+    $script:EditColor = $(if ($Target.IsDefault) { -1 } else { Get-ProfileColorIndex -Id $Target.Id })
+    $swatches = @()
+    for ($i = 0; $i -lt $script:Palette.Count; $i++) {
+        $sw           = New-Object System.Windows.Forms.Button
+        $sw.Location  = New-Object System.Drawing.Point((18 + $i * 40), 92)
+        $sw.Size      = New-Object System.Drawing.Size(32, 32)
+        $sw.FlatStyle = 'Flat'
+        $sw.BackColor = Get-PaletteColor -Index $i
+        $sw.Tag       = $i
+        $sw.Enabled   = -not $Target.IsDefault
+        $sw.Cursor    = [System.Windows.Forms.Cursors]::Hand
+        $sw.FlatAppearance.BorderColor = $ink
+        $sw.Add_Click({
+            $script:EditColor = [int]$this.Tag
+            foreach ($b in $this.Parent.Controls) { if ($b.Tag -is [int]) { $b.FlatAppearance.BorderSize = $(if ($b.Tag -eq $script:EditColor) { 3 } else { 0 }) } }
+        })
+        $sw.FlatAppearance.BorderSize = $(if ($i -eq $script:EditColor) { 3 } else { 0 })
+        $dlg.Controls.Add($sw)
+        $swatches += $sw
+    }
+    if ($Target.IsDefault) { Add-Label 'Your original account keeps the plain Claude icon.' 128 -Small }
+
+    Add-Label 'Environment variables, one per line as NAME=value' 150
+    $envBox            = New-Object System.Windows.Forms.TextBox
+    $envBox.Multiline  = $true
+    $envBox.ScrollBars = 'Vertical'
+    $envBox.AcceptsReturn = $true
+    $envBox.Location   = New-Object System.Drawing.Point(18, 170)
+    $envBox.Size       = New-Object System.Drawing.Size(430, 96)
+    $envBox.Font       = New-Object System.Drawing.Font('Consolas', 9.5)
+    $envBox.Text       = ConvertTo-EnvLines -Vars (Get-ProfileMap -Setting 'ProfileEnv')[$Target.Id]
+    $envBox.Enabled    = -not $storeDefault
+    $dlg.Controls.Add($envBox)
+
+    Add-Label 'Extra launch flags' 278
+    $flags          = New-Object System.Windows.Forms.TextBox
+    $flags.Location = New-Object System.Drawing.Point(18, 298)
+    $flags.Size     = New-Object System.Drawing.Size(430, 26)
+    $flags.Font     = New-Object System.Drawing.Font('Consolas', 9.5)
+    $flags.Text     = [string](Get-ProfileMap -Setting 'ProfileArgs')[$Target.Id]
+    $flags.Enabled  = -not $storeDefault
+    $dlg.Controls.Add($flags)
+    Add-Label $(if ($storeDefault) { 'Your original account starts through the Store, which takes no variables or flags.' }
+                else { 'Variables and flags reach Claude the next time this account starts.' }) 330 -Small
+
+    $ok              = New-Object System.Windows.Forms.Button
+    $ok.Text         = 'Save'
+    $ok.Location     = New-Object System.Drawing.Point(262, 376)
+    $ok.Size         = New-Object System.Drawing.Size(90, 32)
+    $ok.DialogResult = 'OK'
+    $dlg.Controls.Add($ok)
+    $cancel              = New-Object System.Windows.Forms.Button
+    $cancel.Text         = 'Cancel'
+    $cancel.Location     = New-Object System.Drawing.Point(358, 376)
+    $cancel.Size         = New-Object System.Drawing.Size(90, 32)
+    $cancel.DialogResult = 'Cancel'
+    $dlg.Controls.Add($cancel)
+    $dlg.AcceptButton = $ok
+    $dlg.CancelButton = $cancel
+
+    if ($dlg.ShowDialog($form) -ne 'OK') { return $null }
+    return [pscustomobject]@{ Name = $name.Text.Trim(); ColorIndex = $script:EditColor; EnvText = $envBox.Text; Flags = $flags.Text.Trim() }
+}
+
+function Invoke-EditProfile {
     $p = Get-SelectedProfile
     if (-not $p) { return }
-    $answer = Show-Prompt -Message "New name for '$($p.Name)'. Its sign-in and data stay as they are." -Title 'Rename profile' `
-                          -OkText 'Rename' -Initial $p.Name
-    if (-not $answer -or -not $answer.Text -or $answer.Text -ceq $p.Name) { return }
+    $entered = Show-EditDialog -Target $p
+    if (-not $entered) { return }
     try {
-        $renamed = Rename-ClaudeProfile -Target $p -NewName $answer.Text
-        # A new badge letter is a new identity and icon; an open window moves to it now.
+        $parsed = ConvertFrom-EnvLines -Text $entered.EnvText
+        if ($parsed.Invalid.Count) {
+            Show-Message "These lines are not NAME=value with a name made of letters, digits and _ (not starting with a digit), so they were left out:`n`n$($parsed.Invalid -join "`n")" 'Environment variables' 'OK' 'Warning' | Out-Null
+        }
+        $storeDefault = ($p.IsDefault -and $script:ClaudeApp.Kind -eq 'Msix')
+        $launchChanged = $false
+        if (-not $storeDefault) {
+            $oldEnv  = ConvertTo-EnvLines -Vars (Get-ProfileMap -Setting 'ProfileEnv')[$p.Id]
+            $oldArgs = [string](Get-ProfileMap -Setting 'ProfileArgs')[$p.Id]
+            Set-ProfileMapEntry -Setting 'ProfileEnv'  -Id $p.Id -Value $(if ($parsed.Vars.Count) { $parsed.Vars } else { $null })
+            Set-ProfileMapEntry -Setting 'ProfileArgs' -Id $p.Id -Value $(if ($entered.Flags) { $entered.Flags } else { $null })
+            $launchChanged = ((ConvertTo-EnvLines -Vars $parsed.Vars) -ne $oldEnv) -or ($entered.Flags -ne $oldArgs)
+        }
+        $current = $p
+        if (-not $p.IsDefault -and $entered.ColorIndex -ge 0 -and $entered.ColorIndex -ne (Get-ProfileColorIndex -Id $p.Id)) {
+            Set-ProfileChosenColor -Id $p.Id -Index $entered.ColorIndex
+            # New colour, new icon file, new identity: the window, the list and the
+            # shortcuts all pick it up.
+            foreach ($k in @($script:IdentityIcons.Keys | Where-Object { $_ -like "$($p.Id)|*" })) { $script:IdentityIcons.Remove($k) }
+            foreach ($k in @($images.Images.Keys | Where-Object { $_ -like "$($p.Id)|*" })) { $images.Images.RemoveByKey($k) }
+            Get-ProfileIconPath -Target $current -Refresh | Out-Null
+            $removed = @(Remove-ProfileShortcuts -Label $current.Name)
+            foreach ($lnk in $removed) { New-ProfileShortcut -Target $current -Directory (Split-Path $lnk -Parent) | Out-Null }
+        }
+        if ($entered.Name -and $entered.Name -cne $p.Name) {
+            $current = Rename-ClaudeProfile -Target $current -NewName $entered.Name
+        }
         try { Update-RunningProfileIdentity } catch { }
         Update-List -Force
-        Select-ProfileRow -Id $renamed.Id
-        $statusLine.Text = "Renamed '$($p.Name)' to '$($renamed.Name)'."
+        Select-ProfileRow -Id $p.Id
+        $statusLine.Text = "Saved '$($current.Name)'."
+        if ($launchChanged -and $p.Pid) {
+            $answer = Show-Message "'$($current.Name)' is open. Its new variables or flags apply when it starts again.`n`nRestart it now?" 'Restart to apply' 'YesNo' 'Question'
+            if ($answer -eq 'Yes') { Invoke-RestartProfile -Target (Resolve-ClaudeProfile -Name $p.Id -SkipStatus) }
+        }
     } catch {
-        Show-Message $_.Exception.Message 'Could not rename' 'OK' 'Warning' | Out-Null
+        Show-Message $_.Exception.Message 'Could not save' 'OK' 'Warning' | Out-Null
     }
 }
 
@@ -2777,7 +2982,7 @@ $miLaunch   = Add-MenuItem $menu 'Launch'                 { $btnLaunch.PerformCl
 $miLaunch.Font = $fontBold
 $miClose    = Add-MenuItem $menu 'Close'                  { Invoke-CloseProfile }
 $null       = Add-MenuItem $menu 'Restart'                { Invoke-RestartProfile }
-$null       = Add-MenuItem $menu 'Rename...'              { Invoke-RenameProfile } 'F2'
+$null       = Add-MenuItem $menu 'Edit...'                { Invoke-EditProfile } 'F2'
 $null       = Add-MenuItem $menu 'Add shortcuts'          { Invoke-AddShortcuts }
 $null       = Add-MenuItem $menu 'Transfer Code chats...' { $btnTransfer.PerformClick() }
 $null       = Add-MenuItem $menu 'Open folder'            { Invoke-OpenFolder }
@@ -2797,7 +3002,7 @@ $btnLaunch.Add_Click({
     if ($p) { Invoke-LaunchProfile -Target $p }
 })
 $btnNew.Add_Click({ Invoke-AddAccount })
-$btnRename.Add_Click({ Invoke-RenameProfile })
+$btnRename.Add_Click({ Invoke-EditProfile })
 $btnShortcut.Add_Click({ Invoke-AddShortcuts })
 $btnDelete.Add_Click({ Invoke-DeleteProfile })
 $btnClose.Add_Click({ Invoke-CloseProfile })
@@ -2813,7 +3018,7 @@ $listView.Add_KeyDown({
     $keyArgs = $_
     switch ($keyArgs.KeyCode) {
         'Enter'  { $btnLaunch.PerformClick() }
-        'F2'     { Invoke-RenameProfile }
+        'F2'     { Invoke-EditProfile }
         'Delete' { Invoke-DeleteProfile }
         'F5'     { Update-List -Force }
         default  { return }
