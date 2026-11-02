@@ -63,6 +63,8 @@ Run the isolated regression tests with Windows PowerShell 5.1 and PowerShell 7:
     pwsh -NoProfile -File .\tests\TaskbarIdentity.Tests.ps1
     powershell -NoProfile -File .\tests\ProfileLaunch.Tests.ps1
     pwsh -NoProfile -File .\tests\ProfileLaunch.Tests.ps1
+    powershell -NoProfile -File .\tests\CloseAccount.Tests.ps1
+    pwsh -NoProfile -File .\tests\CloseAccount.Tests.ps1
 
 These tests use temporary session stores and shortcuts, and never launch Claude or read
 real chats. The sign-in routing tests write only under a throwaway
@@ -133,6 +135,12 @@ dialog. Copy the event args to a variable before the `switch`.
 
 **Keep the script ASCII only.** Without a BOM, Windows PowerShell 5.1 reads the file in
 the system codepage, so any non-ASCII character renders as garbage on other locales.
+
+## Releasing
+
+Bump `$script:SwitcherVersion` near the top of `ClaudeSwitcher.ps1` in the same change
+that goes into a release; `-Version` and the window's status line show it, and bug
+reports quote it.
 
 ## Style
 

@@ -66,6 +66,16 @@
     Remember an account for claude:// links that are not sign-ins, once sign-in routing
     brings them to the switcher. "Default" forgets it again.
 
+.PARAMETER Close
+    Close the named account's Claude, then exit.
+
+.PARAMETER Restart
+    Close the named account's Claude if it is open, then open it again. The way to pick
+    up changed launch flags or environment variables.
+
+.PARAMETER Version
+    Print the switcher's version, then exit.
+
 .EXAMPLE
     .\ClaudeSwitcher.ps1
     .\ClaudeSwitcher.ps1 -Launch Work
@@ -73,6 +83,7 @@
     .\ClaudeSwitcher.ps1 -AddAccount
     .\ClaudeSwitcher.ps1 -RouteSignIns
     .\ClaudeSwitcher.ps1 -OpenLink "claude://claude.ai/new" -Account Work
+    .\ClaudeSwitcher.ps1 -Restart Work
 #>
 
 # Note for anyone editing this: PowerShell variable names are case-insensitive and
@@ -95,7 +106,10 @@ param(
     [string]$HandleLink,
     [string]$OpenLink,
     [string]$Account,
-    [string]$OpenLinksIn
+    [string]$OpenLinksIn,
+    [string]$Close,
+    [string]$Restart,
+    [switch]$Version
 )
 
 $ErrorActionPreference = 'Stop'
@@ -135,6 +149,9 @@ $script:InstalledScript = Join-Path $script:SwitcherHome 'ClaudeSwitcher.ps1'
 $script:SettingsPath    = Join-Path $script:ProfileRoot 'settings.json'
 $script:DefaultName     = 'Default'
 $script:ScriptPath      = $MyInvocation.MyCommand.Path
+# Bumped with each release (see CONTRIBUTING). Not named $script:Version: that would
+# silently overwrite the -Version switch, the case-insensitive trap from CONTRIBUTING.
+$script:SwitcherVersion = '2.3.0'
 $script:RouterLogPath   = Join-Path $script:SwitcherHome 'sign-in-router.log'
 
 function Test-HandleLinkAlone {
@@ -284,6 +301,9 @@ function Update-ClaudeInstall {
     $script:ClaudeExe          = $script:ClaudeApp.Exe
     $script:DefaultProfilePath = $script:ClaudeApp.DefaultProfilePath
 }
+
+# Answered before looking for Claude, so it works on a machine without it.
+if ($Version) { $script:SwitcherVersion; return }
 
 Update-ClaudeInstall -AllowCache:([bool]$Launch -or [bool]$HandleLink -or [bool]$OpenLink)
 if ($ClaudePath) { Set-Setting 'ClaudePath' $script:ClaudeApp.Exe }
@@ -599,6 +619,62 @@ function Start-ClaudeProfile {
     $argLine = Get-LaunchArgLine -Id $Id -Path $path
     $script:LaunchedProcess = Invoke-WithProfileEnv -Id $Id { Start-Process -FilePath $script:ClaudeExe -ArgumentList $argLine -WindowStyle Normal -PassThru }
     return $(if ($open) { 'focused' } else { 'started' })
+}
+
+# The main process and every Claude.exe that descends from it (renderers, GPU, the
+# crash handler), found through parent ids.
+function Get-ClaudeProcessFamily {
+    param([Parameter(Mandatory)][int]$MainProcessId)
+    $all = @(Get-CimInstance Win32_Process -Filter "Name='Claude.exe'" -ErrorAction SilentlyContinue |
+             Select-Object ProcessId, ParentProcessId)
+    $family = New-Object System.Collections.Generic.List[int]
+    $family.Add($MainProcessId)
+    $queue = @($MainProcessId)
+    while ($queue.Count) {
+        $next = @()
+        foreach ($parent in $queue) {
+            foreach ($p in $all) {
+                if ([int]$p.ParentProcessId -eq $parent -and -not $family.Contains([int]$p.ProcessId)) {
+                    $family.Add([int]$p.ProcessId)
+                    $next += [int]$p.ProcessId
+                }
+            }
+        }
+        $queue = $next
+    }
+    return $family.ToArray()
+}
+
+# Closes the main window politely, waits up to GraceSeconds for the process to leave on
+# its own, then ends it and whatever of its family is still there, and waits for them to
+# go. Pure process work, so the tests can run it on a stand-in.
+function Stop-ProcessGroup {
+    param([Parameter(Mandatory)][int[]]$ProcessIds, [Parameter(Mandatory)][int]$MainProcessId, [int]$GraceSeconds = 3)
+    $main = Get-Process -Id $MainProcessId -ErrorAction SilentlyContinue
+    if ($main) {
+        try { if ($main.MainWindowHandle -ne [IntPtr]::Zero) { $main.CloseMainWindow() | Out-Null } } catch { }
+        try { $main.WaitForExit($GraceSeconds * 1000) | Out-Null } catch { }
+    }
+    foreach ($id in $ProcessIds) {
+        try { Stop-Process -Id $id -Force -ErrorAction Stop } catch { }
+    }
+    $until = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $until) {
+        if (-not @($ProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })) { break }
+        Start-Sleep -Milliseconds 200
+    }
+}
+
+# Ends one account's Claude. Returns 'closed', or 'not running'. Asked to close its
+# window, Claude only hides it to the tray, so after a polite close and a moment to flush
+# the process is ended, and its children follow it.
+function Stop-ClaudeProfile {
+    param([Parameter(Mandatory)][string]$Id, [int]$GraceSeconds = 3)
+    $path = Get-ProfilePath -Id $Id
+    $main = (Get-RunningProfileMap)[$path.TrimEnd('\')]
+    if (-not $main) { return 'not running' }
+    Stop-ProcessGroup -ProcessIds (Get-ClaudeProcessFamily -MainProcessId $main) -MainProcessId $main -GraceSeconds $GraceSeconds
+    return 'closed'
 }
 
 # -------------------------------------------------------------------- icons --
@@ -2040,22 +2116,48 @@ if ($AddAccount) {
     return
 }
 
-if ($Launch) {
-    $target = Resolve-ClaudeProfile -Name $Launch -SkipStatus
-    if (-not $target) {
-        # Used to create a fresh, empty profile, so a typo quietly became a new account.
-        $known = (Get-ProfileList -SkipStatus | ForEach-Object { $_.Name }) -join ', '
-        throw "There is no Claude profile called '$Launch'.`r`n`r`nProfiles: $known"
-    }
-    $how = Start-ClaudeProfile -Id $target.Id
-    if ($how -eq 'started' -and -not $target.IsDefault) {
-        # The window first: its identity has to be set before it is shown.
+# A name typed on the command line. -Launch used to create a fresh, empty profile for a
+# typo, so a misspelling quietly became a new account; now it is an error that lists them.
+function Resolve-ProfileOrThrow {
+    param([Parameter(Mandatory)][string]$Name)
+    $target = Resolve-ClaudeProfile -Name $Name -SkipStatus
+    if ($target) { return $target }
+    $known = (Get-ProfileList -SkipStatus | ForEach-Object { $_.Name }) -join ', '
+    throw "There is no Claude profile called '$Name'.`r`n`r`nProfiles: $known"
+}
+
+# -Launch and -Restart: start the account, give its window the taskbar identity (which
+# has to be set before the window is shown), and take the claude:// handler back if
+# routing is on. Returns what Start-ClaudeProfile did.
+function Start-ProfileFromConsole {
+    param([Parameter(Mandatory)]$Target)
+    $how = Start-ClaudeProfile -Id $Target.Id
+    if ($how -eq 'started' -and -not $Target.IsDefault) {
         try {
-            $watch = New-IdentityWatch -Target $target -Process $script:LaunchedProcess
+            $watch = New-IdentityWatch -Target $Target -Process $script:LaunchedProcess
             while (-not (Step-IdentityWatch -Watch $watch)) { Start-Sleep -Milliseconds 150 }
         } catch { }
         if (Test-SignInRoutingOn) { Wait-RouterRetake }
     }
+    return $how
+}
+
+if ($Launch) {
+    Start-ProfileFromConsole -Target (Resolve-ProfileOrThrow -Name $Launch) | Out-Null
+    return
+}
+
+if ($Close) {
+    $target = Resolve-ProfileOrThrow -Name $Close
+    if ((Stop-ClaudeProfile -Id $target.Id) -eq 'closed') { "Closed '$($target.Name)'." } else { "'$($target.Name)' was not open." }
+    return
+}
+
+if ($Restart) {
+    $target = Resolve-ProfileOrThrow -Name $Restart
+    $was = Stop-ClaudeProfile -Id $target.Id
+    Start-ProfileFromConsole -Target $target | Out-Null
+    $(if ($was -eq 'closed') { "Restarted '$($target.Name)'." } else { "'$($target.Name)' was not open; opened it." })
     return
 }
 
@@ -2225,17 +2327,19 @@ function New-Button {
     return $b
 }
 
-$btnLaunch   = New-Button -Text 'Launch'          -X 20  -Width 116 -Primary
-$btnNew      = New-Button -Text 'Add account'     -X 144
-$btnRename   = New-Button -Text 'Rename'          -X 260 -Width 92
-$btnShortcut = New-Button -Text 'Add shortcuts'   -X 360 -Width 116
-$btnTransfer = New-Button -Text 'Transfer chats'  -X 484 -Width 116
-$btnDelete   = New-Button -Text 'Delete'          -X 616 -Anchor 'Right,Bottom'
+$btnLaunch   = New-Button -Text 'Launch'          -X 20  -Width 100 -Primary
+$btnNew      = New-Button -Text 'Add account'     -X 128 -Width 104
+$btnRename   = New-Button -Text 'Rename'          -X 240 -Width 80
+$btnShortcut = New-Button -Text 'Shortcuts'       -X 328 -Width 92
+$btnTransfer = New-Button -Text 'Transfer chats'  -X 428 -Width 112
+$btnClose    = New-Button -Text 'Close'           -X 548 -Width 80
+$btnDelete   = New-Button -Text 'Delete'          -X 636 -Width 88 -Anchor 'Right,Bottom'
 
 $tips = New-Object System.Windows.Forms.ToolTip
 $tips.SetToolTip($btnNew, 'Opens Claude at a fresh sign-in screen for another account (Ctrl+N)')
 $tips.SetToolTip($btnShortcut, 'Desktop and Start menu shortcuts that open this account directly')
 $tips.SetToolTip($btnTransfer, 'Copy Claude Code chats from this account to another one')
+$tips.SetToolTip($btnClose, "Close this account's Claude window and end its process")
 
 function Get-ProfileImageKey {
     param([Parameter(Mandatory)]$Target)
@@ -2301,7 +2405,7 @@ function Update-List {
     $label = $(if ($script:ClaudeApp.Version -eq 'unknown') { $script:ClaudeApp.Kind } else { $script:ClaudeApp.Version })
     # Kept deliberately ASCII only: without a BOM, Windows PowerShell 5.1 reads this file
     # using the system codepage, so non-ASCII here renders as garbage on other locales.
-    $statusLine.Text = "$($profiles.Count) profile(s), $count running   |   Claude $label"
+    $statusLine.Text = "$($profiles.Count) profile(s), $count running   |   Claude $label   |   Switcher $($script:SwitcherVersion)"
     Update-Buttons
 }
 
@@ -2313,6 +2417,7 @@ function Get-SelectedProfile {
 function Update-Buttons {
     $p = Get-SelectedProfile
     $btnLaunch.Text    = $(if ($p -and $p.Pid) { 'Switch to' } else { 'Launch' })
+    $btnClose.Enabled  = [bool]($p -and $p.Pid)
     $btnDelete.Enabled = [bool]($p -and -not $p.IsDefault)
 }
 
@@ -2417,6 +2522,31 @@ function Invoke-AddAccount {
     $statusLine.Text = "Sign in to '$($created.Name)' in the new Claude window. Press F2 here to give it a better name."
 }
 
+function Invoke-CloseProfile {
+    param($Target)
+    if (-not $Target) { $Target = Get-SelectedProfile }
+    if (-not $Target -or -not $Target.Pid) { return }
+    $statusLine.Text = "Closing '$($Target.Name)'..."
+    [System.Windows.Forms.Application]::DoEvents()
+    try {
+        $result = Stop-ClaudeProfile -Id $Target.Id
+        Update-List -Force
+        $statusLine.Text = $(if ($result -eq 'closed') { "Closed '$($Target.Name)'." } else { "'$($Target.Name)' was not open." })
+    } catch {
+        Show-Message $_.Exception.Message 'Could not close' 'OK' 'Error' | Out-Null
+    }
+}
+
+function Invoke-RestartProfile {
+    param($Target)
+    if (-not $Target) { $Target = Get-SelectedProfile }
+    if (-not $Target) { return }
+    $statusLine.Text = "Restarting '$($Target.Name)'..."
+    [System.Windows.Forms.Application]::DoEvents()
+    try { Stop-ClaudeProfile -Id $Target.Id | Out-Null } catch { }
+    Invoke-LaunchProfile -Target $Target
+}
+
 function Switch-SignInRouting {
     $owner = $(if ($form.Visible) { $form } else { $null })
     try {
@@ -2478,10 +2608,12 @@ function Invoke-OpenFolder {
 function Invoke-DeleteProfile {
     $p = Get-SelectedProfile
     if (-not $p -or $p.IsDefault) { return }
-    $answer = Show-Message "Delete the '$($p.Name)' profile and sign that account out on this computer?`n`nIts folder, saved login and shortcuts are removed. Your other profiles are untouched." `
+    $open = $(if ($p.Pid) { "`n`nIt is open now and will be closed first." } else { '' })
+    $answer = Show-Message "Delete the '$($p.Name)' profile and sign that account out on this computer?`n`nIts folder, saved login and shortcuts are removed. Your other profiles are untouched.$open" `
                            'Delete profile' 'YesNo' 'Warning'
     if ($answer -ne 'Yes') { return }
     try {
+        if ($p.Pid) { Stop-ClaudeProfile -Id $p.Id | Out-Null }
         Remove-ClaudeProfile -Target $p
         Update-List -Force
         $statusLine.Text = "Deleted '$($p.Name)'."
@@ -2643,6 +2775,8 @@ function Add-MenuItem {
 }
 $miLaunch   = Add-MenuItem $menu 'Launch'                 { $btnLaunch.PerformClick() } 'Enter'
 $miLaunch.Font = $fontBold
+$miClose    = Add-MenuItem $menu 'Close'                  { Invoke-CloseProfile }
+$null       = Add-MenuItem $menu 'Restart'                { Invoke-RestartProfile }
 $null       = Add-MenuItem $menu 'Rename...'              { Invoke-RenameProfile } 'F2'
 $null       = Add-MenuItem $menu 'Add shortcuts'          { Invoke-AddShortcuts }
 $null       = Add-MenuItem $menu 'Transfer Code chats...' { $btnTransfer.PerformClick() }
@@ -2653,6 +2787,7 @@ $menu.Add_Opening({
     $p = Get-SelectedProfile
     if (-not $p) { $_.Cancel = $true; return }
     $miLaunch.Text    = $(if ($p.Pid) { 'Switch to' } else { 'Launch' })
+    $miClose.Enabled  = [bool]$p.Pid
     $miDelete.Enabled = -not $p.IsDefault
 })
 $listView.ContextMenuStrip = $menu
@@ -2665,6 +2800,7 @@ $btnNew.Add_Click({ Invoke-AddAccount })
 $btnRename.Add_Click({ Invoke-RenameProfile })
 $btnShortcut.Add_Click({ Invoke-AddShortcuts })
 $btnDelete.Add_Click({ Invoke-DeleteProfile })
+$btnClose.Add_Click({ Invoke-CloseProfile })
 $btnTransfer.Add_Click({
     $p = Get-SelectedProfile
     if ($p) { Show-TransferDialog -Source $p }
@@ -2685,7 +2821,14 @@ $listView.Add_KeyDown({
     $keyArgs.Handled = $true
 })
 $form.Add_KeyDown({
-    if ($_.Control -and $_.KeyCode -eq 'N') { Invoke-AddAccount; $_.Handled = $true }
+    if ($_.Control -and $_.KeyCode -eq 'N') { Invoke-AddAccount; $_.Handled = $true; return }
+    # Ctrl+1 to Ctrl+9 open the accounts in list order (D1 is 49).
+    $code = [int]$_.KeyCode
+    if ($_.Control -and $code -ge 49 -and $code -le 57) {
+        $n = $code - 49
+        if ($n -lt $listView.Items.Count) { Invoke-LaunchProfile -Target $listView.Items[$n].Tag }
+        $_.Handled = $true
+    }
 })
 
 # ---- tray
@@ -2714,7 +2857,8 @@ function Exit-Switcher {
 
 $trayMenu.Add_Opening({
     $trayMenu.Items.Clear()
-    foreach ($p in (Get-ProfileList)) {
+    $profiles = @(Get-ProfileList)
+    foreach ($p in $profiles) {
         $mi       = New-Object System.Windows.Forms.ToolStripMenuItem($p.Name)
         $mi.Image = $images.Images[(Get-ProfileImageKey -Target $p)]
         # Next to an icon a check mark is barely visible, so open accounts are spelled out.
@@ -2722,6 +2866,26 @@ $trayMenu.Add_Opening({
         $mi.Tag   = $p
         $mi.Add_Click({ Invoke-LaunchProfile -Target $this.Tag })
         $trayMenu.Items.Add($mi) | Out-Null
+    }
+    # One click still switches; closing is two, under its own entry, so it cannot be hit
+    # by mistake.
+    $openOnes = @($profiles | Where-Object { $_.Pid })
+    if ($openOnes.Count) {
+        $closeMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Close')
+        foreach ($p in $openOnes) {
+            $ci     = New-Object System.Windows.Forms.ToolStripMenuItem($p.Name)
+            $ci.Tag = $p
+            $ci.Add_Click({ Invoke-CloseProfile -Target $this.Tag })
+            $closeMenu.DropDownItems.Add($ci) | Out-Null
+        }
+        if ($openOnes.Count -gt 1) {
+            $closeMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+            $all     = New-Object System.Windows.Forms.ToolStripMenuItem('Close all')
+            $all.Tag = $openOnes
+            $all.Add_Click({ foreach ($p in $this.Tag) { Invoke-CloseProfile -Target $p } })
+            $closeMenu.DropDownItems.Add($all) | Out-Null
+        }
+        $trayMenu.Items.Add($closeMenu) | Out-Null
     }
     $trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
     $null = Add-MenuItem $trayMenu 'Add account...' { Invoke-AddAccount }
