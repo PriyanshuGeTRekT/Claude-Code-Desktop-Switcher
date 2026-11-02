@@ -4,8 +4,16 @@
 
 This tool is a launcher. It creates directories under `%LOCALAPPDATA%`,
 starts the Claude desktop app with a `--user-data-dir` argument, and creates shortcuts.
-It does not modify the Claude application, handle credentials, or make network requests
-of its own.
+It does not modify the Claude application or handle credentials.
+
+Its only network requests are for its own updates, to this repository's GitHub releases:
+once a day the window fetches the latest release's `SHA256SUMS.txt` (about 300 bytes),
+and the script itself only when that checksum differs from the installed copy. A
+downloaded script is installed only when it matches the published checksum, parses, and
+is newer than the installed one, and only after you say yes. Nothing about you or your
+accounts is sent. `"UpdateCheck": false` in `settings.json` stops the daily look
+entirely; `-Update` and the tray's **Check for updates** are the only other times it
+goes online.
 
 If you turn on sign-in routing, the switcher also becomes the handler for `claude://` links,
 which means it receives text from your browser. Each link is checked before use: only

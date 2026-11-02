@@ -89,6 +89,14 @@ jobs:
         shell: pwsh
         run: .\tests\EditAccount.Tests.ps1
 
+      - name: Update tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\Update.Tests.ps1
+
+      - name: Update tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\Update.Tests.ps1
+
       - name: Install PSScriptAnalyzer
         shell: pwsh
         run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck

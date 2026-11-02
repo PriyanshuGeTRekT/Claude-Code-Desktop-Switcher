@@ -76,6 +76,14 @@
 .PARAMETER Version
     Print the switcher's version, then exit.
 
+.PARAMETER Update
+    Install the latest release over this switcher, if it is newer, then exit.
+
+.PARAMETER CheckUpdate
+    Used by the window once a day: look for a newer release and note it for the window
+    to show, then exit. Downloads the release's checksum file, and the script only when
+    the checksum differs.
+
 .EXAMPLE
     .\ClaudeSwitcher.ps1
     .\ClaudeSwitcher.ps1 -Launch Work
@@ -109,7 +117,9 @@ param(
     [string]$OpenLinksIn,
     [string]$Close,
     [string]$Restart,
-    [switch]$Version
+    [switch]$Version,
+    [switch]$Update,
+    [switch]$CheckUpdate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -304,6 +314,168 @@ function Update-ClaudeInstall {
 
 # Answered before looking for Claude, so it works on a machine without it.
 if ($Version) { $script:SwitcherVersion; return }
+
+# ------------------------------------------------------------------ updates --
+
+<#
+    Releases publish ClaudeSwitcher.ps1 next to SHA256SUMS.txt. A check fetches the
+    checksum file (about 300 bytes) and compares it with the installed copy; the script
+    itself is fetched only when they differ, and installed only when it matches the
+    checksum, parses, and is newer. Nothing else is sent or fetched, and nothing at all
+    once "UpdateCheck": false is in settings.json.
+#>
+$script:ReleaseBase    = 'https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/releases/latest/download'
+$script:UpdateInfoPath = Join-Path $script:SwitcherHome 'update-available.json'
+$script:UpdateLogPath  = Join-Path $script:SwitcherHome 'update.log'
+
+function Write-UpdateLog {
+    param([string]$Message)
+    try {
+        New-Item -ItemType Directory -Force -Path (Split-Path $script:UpdateLogPath -Parent) | Out-Null
+        if ((Test-Path -LiteralPath $script:UpdateLogPath) -and (Get-Item -LiteralPath $script:UpdateLogPath).Length -gt 100KB) {
+            Remove-Item -LiteralPath $script:UpdateLogPath -Force
+        }
+        Add-Content -LiteralPath $script:UpdateLogPath -Value ('[{0}] {1}' -f (Get-Date -Format 's'), $Message)
+    } catch { }
+}
+
+# The sha256sum line for one file name in a SHA256SUMS.txt, with or without the binary
+# marker (*) in front of the name.
+function Get-PublishedHash {
+    param([string]$Sums, [Parameter(Mandatory)][string]$File)
+    foreach ($line in @($Sums -split "`r?`n")) {
+        if ($line -match '^\s*([0-9a-fA-F]{64})\s+\*?(.+?)\s*$' -and $Matches[2] -eq $File) { return $Matches[1].ToLower() }
+    }
+    return $null
+}
+
+function Get-ScriptVersion {
+    param([string]$Text)
+    if ($Text -match "(?m)^\`$script:SwitcherVersion\s*=\s*'([^']+)'") { return $Matches[1] }
+    return $null
+}
+
+# -1, 0 or 1 for A against B, on the dotted numbers; anything after them (a pre-release
+# tag) is ignored, and missing parts count as 0.
+function Compare-SwitcherVersion {
+    param([Parameter(Mandatory)][string]$A, [Parameter(Mandatory)][string]$B)
+    $pa = @(($A -replace '[^0-9.].*$', '') -split '\.' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+    $pb = @(($B -replace '[^0-9.].*$', '') -split '\.' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+    for ($i = 0; $i -lt [math]::Max($pa.Count, $pb.Count); $i++) {
+        $x = $(if ($i -lt $pa.Count) { $pa[$i] } else { 0 })
+        $y = $(if ($i -lt $pb.Count) { $pb[$i] } else { 0 })
+        if ($x -ne $y) { return $(if ($x -lt $y) { -1 } else { 1 }) }
+    }
+    return 0
+}
+
+# The file an update replaces: the installed copy when there is one, else this script.
+function Get-UpdateTarget {
+    if (Test-Path -LiteralPath $script:InstalledScript) { return $script:InstalledScript }
+    return $script:ScriptPath
+}
+
+function Get-WebFile {
+    param([Parameter(Mandatory)][string]$Url, [Parameter(Mandatory)][string]$Path)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $previous = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try { Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Path -TimeoutSec 30 } finally { $ProgressPreference = $previous }
+}
+
+# A downloaded script is accepted only when it matches the published checksum and parses.
+# Returns its version, or $null for a release older than the version line itself (before
+# 2.3.0), which can never be newer.
+function Test-DownloadedScript {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ExpectedHash)
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower()
+    if ($actual -ne $ExpectedHash.ToLower()) { throw "The downloaded script does not match the published checksum." }
+    $errors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$errors) | Out-Null
+    if ($errors -and $errors.Count) { throw "The downloaded script does not parse: $($errors[0].Message)" }
+    return (Get-ScriptVersion -Text (Get-Content -LiteralPath $Path -Raw))
+}
+
+function New-TempFileName {
+    param([string]$Suffix)
+    return (Join-Path ([IO.Path]::GetTempPath()) ('claude-switcher-' + [guid]::NewGuid().ToString('N') + $Suffix))
+}
+
+# Looks at the latest release. Returns @{ Version; Path } for a newer script, downloaded
+# and verified into a temporary file, or $null when the installed one is current.
+function Find-SwitcherUpdate {
+    $sumsPath = New-TempFileName -Suffix '.txt'
+    try {
+        Get-WebFile -Url "$($script:ReleaseBase)/SHA256SUMS.txt" -Path $sumsPath
+        $published = Get-PublishedHash -Sums (Get-Content -LiteralPath $sumsPath -Raw) -File 'ClaudeSwitcher.ps1'
+    } finally { Remove-Item -LiteralPath $sumsPath -Force -ErrorAction SilentlyContinue }
+    if (-not $published) { throw 'The release has no checksum for ClaudeSwitcher.ps1.' }
+    $target = Get-UpdateTarget
+    if ((Test-Path -LiteralPath $target) -and (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLower() -eq $published) { return $null }
+    $scriptPath = New-TempFileName -Suffix '.ps1'
+    Get-WebFile -Url "$($script:ReleaseBase)/ClaudeSwitcher.ps1" -Path $scriptPath
+    try {
+        $found = Test-DownloadedScript -Path $scriptPath -ExpectedHash $published
+    } catch {
+        Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
+        throw
+    }
+    if (-not $found -or (Compare-SwitcherVersion -A $found -B $script:SwitcherVersion) -le 0) {
+        # A different file that is not newer: a release from before the version line, a
+        # development build here, or a re-published release. Not an update.
+        Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    return @{ Version = $found; Path = $scriptPath }
+}
+
+function Install-SwitcherUpdate {
+    param([Parameter(Mandatory)]$Found)
+    $target = Get-UpdateTarget
+    Copy-Item -LiteralPath $Found.Path -Destination $target -Force
+    try { Unblock-File -LiteralPath $target } catch { }
+    Remove-Item -LiteralPath $Found.Path -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $script:UpdateInfoPath -Force -ErrorAction SilentlyContinue
+    Write-UpdateLog "Installed $($Found.Version) over $($script:SwitcherVersion) at $target."
+}
+
+function Test-SwitcherRunning {
+    $existing = $null
+    return [System.Threading.Mutex]::TryOpenExisting('Local\ClaudeProfileSwitcher', [ref]$existing)
+}
+
+# The daily look, run by the window in a process of its own so a slow connection never
+# freezes it. Leaves update-available.json for the window to read, or removes it.
+if ($CheckUpdate) {
+    try {
+        $found = Find-SwitcherUpdate
+        if ($found) {
+            Remove-Item -LiteralPath $found.Path -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $script:SwitcherHome | Out-Null
+            @{ Version = $found.Version; Checked = (Get-Date).ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath $script:UpdateInfoPath -Encoding UTF8
+            Write-UpdateLog "Found $($found.Version) (installed: $($script:SwitcherVersion))."
+        } else {
+            Remove-Item -LiteralPath $script:UpdateInfoPath -Force -ErrorAction SilentlyContinue
+        }
+    } catch { Write-UpdateLog "Check failed: $($_.Exception.Message)" }
+    return
+}
+
+if ($Update) {
+    # Reported on the console, not through the window's error box.
+    try {
+        $found = Find-SwitcherUpdate
+        if (-not $found) { "You have the latest version ($($script:SwitcherVersion))."; return }
+        Install-SwitcherUpdate -Found $found
+        "Installed $($found.Version) to $(Get-UpdateTarget)."
+        if (Test-SwitcherRunning) { 'The switcher window or tray is open: exit it and open it again to use the new version.' }
+    } catch {
+        Write-UpdateLog "Update failed: $($_.Exception.Message)"
+        Write-Error "Could not update: $($_.Exception.Message)" -ErrorAction Continue
+        exit 1
+    }
+    return
+}
 
 Update-ClaudeInstall -AllowCache:([bool]$Launch -or [bool]$HandleLink -or [bool]$OpenLink)
 if ($ClaudePath) { Set-Setting 'ClaudePath' $script:ClaudeApp.Exe }
@@ -2486,7 +2658,8 @@ function Update-List {
     $label = $(if ($script:ClaudeApp.Version -eq 'unknown') { $script:ClaudeApp.Kind } else { $script:ClaudeApp.Version })
     # Kept deliberately ASCII only: without a BOM, Windows PowerShell 5.1 reads this file
     # using the system codepage, so non-ASCII here renders as garbage on other locales.
-    $statusLine.Text = "$($profiles.Count) profile(s), $count running   |   Claude $label   |   Switcher $($script:SwitcherVersion)"
+    $statusLine.Text = "$($profiles.Count) profile(s), $count running   |   Claude $label   |   Switcher $($script:SwitcherVersion)" +
+                       $(if ($script:UpdateAvailable) { "   |   $($script:UpdateAvailable) is out: tray icon > Update" } else { '' })
     Update-Buttons
 }
 
@@ -2626,6 +2799,66 @@ function Invoke-RestartProfile {
     [System.Windows.Forms.Application]::DoEvents()
     try { Stop-ClaudeProfile -Id $Target.Id | Out-Null } catch { }
     Invoke-LaunchProfile -Target $Target
+}
+
+$script:UpdateAvailable  = $null
+$script:RestartAfterExit = $false
+
+function Read-UpdateInfo {
+    $script:UpdateAvailable = $null
+    if (-not (Test-Path -LiteralPath $script:UpdateInfoPath)) { return }
+    try {
+        $info = Get-Content -LiteralPath $script:UpdateInfoPath -Raw | ConvertFrom-Json
+        if ((Compare-SwitcherVersion -A ([string]$info.Version) -B $script:SwitcherVersion) -gt 0) { $script:UpdateAvailable = [string]$info.Version }
+    } catch { }
+}
+
+# In a process of its own, with this same script, so a slow connection never freezes
+# the window. The result lands in update-available.json.
+function Start-UpdateCheck {
+    Set-Setting 'LastUpdateCheck' (Get-Date).ToString('o')
+    $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+    $cmd     = "-NoProfile -ExecutionPolicy Bypass -File `"$($script:ScriptPath)`" -CheckUpdate"
+    if ([Environment]::OSVersion.Version.Build -ge 17763 -and (Test-Path -LiteralPath $conhost)) {
+        Start-Process -FilePath $conhost -ArgumentList "--headless `"$ps`" $cmd"
+    } else {
+        Start-Process -FilePath $ps -ArgumentList $cmd -WindowStyle Hidden
+    }
+}
+
+function Invoke-UpdateSwitcher {
+    $statusLine.Text = 'Checking for updates...'
+    [System.Windows.Forms.Application]::DoEvents()
+    try {
+        $found = Find-SwitcherUpdate
+    } catch {
+        Show-Message "Could not check for updates: $($_.Exception.Message)" 'Update' 'OK' 'Warning' | Out-Null
+        Update-List -Force
+        return
+    }
+    if (-not $found) {
+        Remove-Item -LiteralPath $script:UpdateInfoPath -Force -ErrorAction SilentlyContinue
+        $script:UpdateAvailable = $null
+        Update-List -Force
+        Show-Message "You have the latest version ($($script:SwitcherVersion))." 'Update' | Out-Null
+        return
+    }
+    $answer = Show-Message "Version $($found.Version) is available; you have $($script:SwitcherVersion).`n`nInstall it now? The switcher closes and opens again. Your accounts are not touched." 'Update' 'YesNo' 'Question'
+    if ($answer -ne 'Yes') {
+        Remove-Item -LiteralPath $found.Path -Force -ErrorAction SilentlyContinue
+        Update-List -Force
+        return
+    }
+    try {
+        Install-SwitcherUpdate -Found $found
+    } catch {
+        Show-Message "Could not install the update: $($_.Exception.Message)" 'Update' 'OK' 'Error' | Out-Null
+        return
+    }
+    # Started again from the finally block, once this copy has let go of the mutex.
+    $script:RestartAfterExit = $true
+    Exit-Switcher
 }
 
 function Switch-SignInRouting {
@@ -3104,6 +3337,8 @@ $trayMenu.Add_Opening({
     $route = Add-MenuItem $trayMenu 'Send sign-ins to the right account' { Switch-SignInRouting }
     $route.Checked = (Test-SignInRoutingOn)
     $trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+    $upd = Add-MenuItem $trayMenu $(if ($script:UpdateAvailable) { "Update to $($script:UpdateAvailable)..." } else { 'Check for updates...' }) { Invoke-UpdateSwitcher }
+    if ($script:UpdateAvailable) { $upd.Font = $fontBold }
     $null = Add-MenuItem $trayMenu 'Exit' { Exit-Switcher }
     $_.Cancel = $false
 })
@@ -3170,6 +3405,27 @@ $routerTimer.Add_Tick({
 })
 $routerTimer.Start()
 
+# Once a day, in a process of its own, unless UpdateCheck is false. The first look comes
+# 20 s after start; the result file is read every minute after that.
+$updateTimer = New-Object System.Windows.Forms.Timer
+$updateTimer.Interval = 20000
+$updateTimer.Add_Tick({
+    $updateTimer.Interval = 60000
+    if ((Get-Setting 'UpdateCheck') -ne $false) {
+        $due  = $true
+        $last = Get-Setting 'LastUpdateCheck'
+        if ($last) { try { $due = ([datetime]$last) -lt (Get-Date).AddHours(-24) } catch { } }
+        if ($due) { try { Start-UpdateCheck } catch { } }
+    }
+    $before = $script:UpdateAvailable
+    Read-UpdateInfo
+    if ($script:UpdateAvailable -and $script:UpdateAvailable -ne $before) {
+        Update-List -Force
+        try { $notify.ShowBalloonTip(5000, 'Update available', "Claude Profile Switcher $($script:UpdateAvailable) is out. Right-click the tray icon to install it.", 'Info') } catch { }
+    }
+})
+$updateTimer.Start()
+
 # Left behind by -Revert while the router was still the Default apps choice. Once the user
 # has picked something else, nothing points at it any more.
 if (-not (Test-SignInRoutingOn) -and (Test-Path -LiteralPath (Get-RouterRegistryPath).ProgId)) {
@@ -3177,6 +3433,7 @@ if (-not (Test-SignInRoutingOn) -and (Test-Path -LiteralPath (Get-RouterRegistry
 }
 
 $script:ExitRequested = $false
+Read-UpdateInfo
 $notify.Visible = $true
 Update-List -Force
 if (-not $Tray) { Show-Switcher }
@@ -3186,4 +3443,5 @@ try {
     $notify.Visible = $false
     $notify.Dispose()
     try { $script:InstanceMutex.ReleaseMutex() } catch { }
+    if ($script:RestartAfterExit) { try { Start-SwitcherWindow } catch { } }
 }
