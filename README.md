@@ -24,7 +24,7 @@
 | --- | --- |
 | **Add an account in one click** | **Add account** opens a fresh Claude window at the sign-in screen. Sign in and you're done. |
 | **Concurrent accounts** | Every account runs in its own window. Open as many as you like at the same time. |
-| **One click to switch** | Launch a profile, or bring it to the front if it is already open. Also from the tray. |
+| **One click to switch** | Launch a profile, or bring it to the front if it is already open. Close or restart it from the same place. Also from the tray. |
 | **Move Claude Code chats** | Copy chats from one account to another and carry on where you left off. |
 | **Sign-ins land in the right account** | Optional: a browser sign-in comes back to the account that asked for it, not to your original one. |
 | **Icons you can tell apart** | Each profile gets a coloured badge for its shortcuts and its own taskbar button. |
@@ -69,6 +69,9 @@ You can also add an account without opening the switcher: search Start for
 | Action | Button | Keyboard |
 | --- | --- | --- |
 | Open a profile, or switch to it if it is open | **Launch** / **Switch to**, or double-click | <kbd>Enter</kbd> |
+| Open the first, second, ... account in the list | | <kbd>Ctrl</kbd>+<kbd>1</kbd> to <kbd>9</kbd> |
+| Close an account's Claude | **Close**, or the tray's **Close** entry | |
+| Restart it (picks up changed flags or variables) | right-click, **Restart** | |
 | Add an account, opens straight to sign-in | **Add account** | <kbd>Ctrl</kbd>+<kbd>N</kbd> |
 | Rename (only the label, sign-in is unaffected) | **Rename** | <kbd>F2</kbd> |
 | Desktop and Start menu shortcuts | **Add shortcuts** | |
@@ -148,8 +151,8 @@ there are no brackets):
 
 The switcher sets them only for the Claude it starts, then restores its own. They apply
 only when that account's Claude starts fresh: if it is already running, Electron hands
-the launch to the running copy, which keeps the environment it started with. Quit it
-from the tray first. On the Store build, `Default` opened from the switcher starts
+the launch to the running copy, which keeps the environment it started with. Use
+**Restart** (or `-Restart`) to apply a change. On the Store build, `Default` opened from the switcher starts
 through the shell and does not get them. Names must be letters, digits and `_`, not
 starting with a digit; others are skipped.
 
@@ -173,6 +176,9 @@ same two limits apply: a copy that is already open keeps the flags it started wi
 | `.\ClaudeSwitcher.ps1` | Open the window |
 | `.\ClaudeSwitcher.ps1 -AddAccount` | Add an account and open Claude at its sign-in screen |
 | `.\ClaudeSwitcher.ps1 -Launch Work` | Open a profile, or bring it forward if it is open |
+| `.\ClaudeSwitcher.ps1 -Close Work` | Close that account's Claude |
+| `.\ClaudeSwitcher.ps1 -Restart Work` | Close it if open, then open it again |
+| `.\ClaudeSwitcher.ps1 -Version` | Print the switcher's version |
 | `.\ClaudeSwitcher.ps1 -List` | Print profiles and which are running |
 | `.\ClaudeSwitcher.ps1 -Shortcut Work` | Desktop and Start menu shortcuts for one profile |
 | `.\ClaudeSwitcher.ps1 -Shortcut Work -To <dir>` | A shortcut in a folder of your choice |

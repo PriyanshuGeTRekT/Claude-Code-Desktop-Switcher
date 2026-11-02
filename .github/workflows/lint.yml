@@ -73,6 +73,14 @@ jobs:
         shell: pwsh
         run: .\tests\ProfileLaunch.Tests.ps1
 
+      - name: Close account tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\CloseAccount.Tests.ps1
+
+      - name: Close account tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\CloseAccount.Tests.ps1
+
       - name: Install PSScriptAnalyzer
         shell: pwsh
         run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
