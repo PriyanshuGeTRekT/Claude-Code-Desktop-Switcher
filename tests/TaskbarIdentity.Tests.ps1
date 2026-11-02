@@ -3,11 +3,14 @@ $source = Join-Path (Split-Path $PSScriptRoot -Parent) 'ClaudeSwitcher.ps1'
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$null, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in @('Get-BadgeLetter','Get-ProfileAumid','Get-LauncherScript','Get-ProfileRelaunchCommand','Initialize-TaskbarIdentity')) {
+foreach ($name in @('Get-BadgeLetter','Get-ProfileAumid','Get-LauncherScript','Get-ProfileRelaunchCommand','Initialize-TaskbarIdentity',
+                    'Get-ProfileColorSuffix','Get-ProfileChosenColor','Get-ProfileMap')) {
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}, $true)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
 }
+# No settings here: colours stay automatic, so identities carry no colour suffix.
+function Get-Setting { param($Name) return $null }
 $assignment = $ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and
                          $n.Left.Extent.Text -eq '$script:TaskbarIdentitySource'}, $true)
 if (-not $assignment) { throw 'Missing $script:TaskbarIdentitySource' }

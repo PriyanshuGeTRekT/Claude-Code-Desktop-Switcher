@@ -60,7 +60,7 @@ moving or deleting it breaks nothing.
 
 1. Click **Add account**. A new Claude window opens at the sign-in screen.
 2. Sign in with your other account. That's it: both accounts stay signed in from now on.
-3. Optionally press <kbd>F2</kbd> to rename it from `Account 2` to something like `Work`.
+3. Optionally press <kbd>F2</kbd> to name it something like `Work` and pick its badge colour.
 
 You can also add an account without opening the switcher: search Start for
 **Claude - Add account**, pick **Add account** from the tray icon, or run
@@ -73,7 +73,7 @@ You can also add an account without opening the switcher: search Start for
 | Close an account's Claude | **Close**, or the tray's **Close** entry | |
 | Restart it (picks up changed flags or variables) | right-click, **Restart** | |
 | Add an account, opens straight to sign-in | **Add account** | <kbd>Ctrl</kbd>+<kbd>N</kbd> |
-| Rename (only the label, sign-in is unaffected) | **Rename** | <kbd>F2</kbd> |
+| Name, badge colour, environment variables, launch flags | **Edit...** | <kbd>F2</kbd> |
 | Desktop and Start menu shortcuts | **Add shortcuts** | |
 | Copy Claude Code chats to another account | **Transfer chats** | |
 | Delete a profile and its shortcuts | **Delete** | <kbd>Del</kbd> |
@@ -140,10 +140,13 @@ one account before picking it up in the other.
 
 ### Environment variables and launch flags per account
 
-To give one account's Claude its own environment variables (for example for an MCP
-server it runs), add `ProfileEnv` to `%LOCALAPPDATA%\ClaudeProfiles\settings.json`,
-keyed by the profile's folder name (the one `-List` shows in brackets, or its name when
-there are no brackets):
+Select an account and click **Edit...** (or press <kbd>F2</kbd>) to set its environment
+variables, one per line as `NAME=value`, and any extra launch flags. If the account is
+open, the switcher offers to restart it so they take effect.
+
+The same settings live in `%LOCALAPPDATA%\ClaudeProfiles\settings.json`, keyed by the
+profile's folder name (the one `-List` shows in brackets, or its name when there are no
+brackets), if you would rather edit them there:
 
 ```json
 "ProfileEnv": { "Work": { "MY_VAR": "value" } }
@@ -257,7 +260,10 @@ Claude ships in two shapes on Windows, and the switcher detects whichever you ha
 - **Running detection** only counts the desktop app's own process. The Claude Code CLI is also
   called `claude.exe` and the desktop app starts one per Code session; those are ignored.
 - **Renaming** changes a label only. The folder name is a profile's permanent id, because
-  Electron stores absolute paths inside its data.
+  Electron stores absolute paths inside its data. A badge colour you pick in **Edit...** is
+  stored on its own (`ChosenColors`), so an upgrade never changes the automatic colours,
+  icon files or taskbar identities of existing accounts; picking one gives that account a
+  new icon file and identity, like a rename that changes the letter.
 - **Chat transfer** copies the small per-chat file the desktop app keeps under
   `claude-code-sessions\<account>\<organisation>` into the other profile, re-pointed at that
   profile's account. The transcript itself is kept by Claude Code outside the profile.
