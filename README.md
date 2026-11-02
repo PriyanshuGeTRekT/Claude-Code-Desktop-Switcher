@@ -54,6 +54,12 @@ moving or deleting it breaks nothing.
 > [!TIP]
 > Downloaded a ZIP instead? Run `Get-ChildItem -Recurse | Unblock-File` in the folder first.
 
+**Updating:** right-click the tray icon and choose **Check for updates**, or run
+`ClaudeSwitcher.ps1 -Update`. Once a day the switcher also looks for a new release on its
+own (it fetches a 300-byte checksum file from GitHub and nothing else) and tells you in
+the status line and the tray. Put `"UpdateCheck": false` in
+`%LOCALAPPDATA%\ClaudeProfiles\settings.json` to stop that.
+
 ## Using it
 
 <img src="docs/images/first-run.png" alt="The switcher on first run, with only the original account and a prompt to click Add account" width="600">
@@ -182,6 +188,7 @@ same two limits apply: a copy that is already open keeps the flags it started wi
 | `.\ClaudeSwitcher.ps1 -Close Work` | Close that account's Claude |
 | `.\ClaudeSwitcher.ps1 -Restart Work` | Close it if open, then open it again |
 | `.\ClaudeSwitcher.ps1 -Version` | Print the switcher's version |
+| `.\ClaudeSwitcher.ps1 -Update` | Install the latest release if it is newer |
 | `.\ClaudeSwitcher.ps1 -List` | Print profiles and which are running |
 | `.\ClaudeSwitcher.ps1 -Shortcut Work` | Desktop and Start menu shortcuts for one profile |
 | `.\ClaudeSwitcher.ps1 -Shortcut Work -To <dir>` | A shortcut in a folder of your choice |
