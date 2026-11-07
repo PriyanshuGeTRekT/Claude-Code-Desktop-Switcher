@@ -856,7 +856,7 @@ class Router:
         def to_default(note):
             try:
                 how = Router.deliver(link, resolve(DEFAULT_ID))
-                Router.log("%s (%s)" % (note, how))
+                Router.log("%s (%s)." % (note.rstrip("."), how))
             except Exception as e:  # losing the link would be worse than any error
                 Router.log("Could not pass a link to Default: %s" % e)
 
@@ -1269,6 +1269,9 @@ def gtk_available():
 
 def run_gui(snapshot=None, appearance=None, snapshot_edit=None):
     global RUNNING_GUI
+    if appearance == "dark":
+        # Read as GTK loads, so it has to be set before the import.
+        os.environ["GTK_THEME"] = "Adwaita:dark"
     try:
         import gi
         gi.require_version("Gtk", "3.0")
