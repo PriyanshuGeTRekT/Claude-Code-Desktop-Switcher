@@ -1498,7 +1498,7 @@ func runCommandLine(_ args: [String]) throws -> Bool {
         alert.layout()
         alert.window.orderFrontRegardless()
         RunLoop.current.run(until: Date().addingTimeInterval(0.6))
-        guard let frame = alert.window.contentView?.superview ?? alert.window.contentView,
+        guard let frame = alert.window.contentView,
               let rep = frame.bitmapImageRepForCachingDisplay(in: frame.bounds) else { throw SwitcherError("Could not render the dialog.") }
         frame.cacheDisplay(in: frame.bounds, to: rep)
         // The dialog's own backdrop is a blur that a cached drawing leaves out, so lay the
