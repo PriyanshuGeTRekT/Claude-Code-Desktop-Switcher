@@ -1,7 +1,8 @@
 #!/bin/bash
 # Builds the Linux downloads into OUT (default: dist):
 #   claude-switcher                               the program itself (also what --update fetches)
-#   claude-profile-switcher_<version>_all.deb     for Ubuntu and Debian
+#   claude-profile-switcher_all.deb               for Ubuntu and Debian (a stable name, so
+#                                                 releases/latest/download links keep working)
 #   ClaudeProfileSwitcher-linux.tar.gz            the program and install.sh, for any distribution
 # Usage: linux/build.sh [OUT]
 set -euo pipefail
@@ -62,7 +63,7 @@ Description: Run several Claude desktop accounts at once
  launchers per account, Claude Code chat transfer between accounts and sign-in routing.
  Unofficial; not affiliated with Anthropic.
 EOF
-dpkg-deb --root-owner-group --build "$pkg" "$out/claude-profile-switcher_${version}_all.deb" >/dev/null
+dpkg-deb --root-owner-group --build "$pkg" "$out/claude-profile-switcher_all.deb" >/dev/null
 
 # tarball
 tarroot="$(mktemp -d)/ClaudeProfileSwitcher-linux"

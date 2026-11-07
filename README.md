@@ -2,7 +2,7 @@
 
 # Claude Profile Switcher
 
-**Use several Claude desktop accounts at the same time, on Windows and macOS.**<br>
+**Use several Claude desktop accounts at the same time, on Windows, macOS and Linux.**<br>
 Separate logins side by side, one click to add or switch, and nothing to sign out of.
 
 [![Stars](https://img.shields.io/github/stars/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher?style=flat-square&color=cb7b5d)](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/stargazers)
@@ -10,10 +10,12 @@ Separate logins side by side, one click to add or switch, and nothing to sign ou
 [![Views](https://visitor-badge.laobi.icu/badge?page_id=PriyanshuGeTRekT.Claude-Code-Desktop-Switcher&left_text=views)](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher)
 [![Windows tests](https://img.shields.io/github/actions/workflow/status/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/lint.yml?branch=main&style=flat-square&label=windows%20tests)](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/actions/workflows/lint.yml)
 [![macOS tests](https://img.shields.io/github/actions/workflow/status/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/macos.yml?branch=main&style=flat-square&label=macOS%20tests)](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/actions/workflows/macos.yml)
+[![Linux tests](https://img.shields.io/github/actions/workflow/status/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/linux.yml?branch=main&style=flat-square&label=Linux%20tests)](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/actions/workflows/linux.yml)
 [![License](https://img.shields.io/github/license/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher?style=flat-square)](LICENSE)
 <br>
 ![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square&logo=windows)
 ![macOS 12+](https://img.shields.io/badge/macOS-12%2B-000000?style=flat-square&logo=apple)
+![Linux: Ubuntu | Debian](https://img.shields.io/badge/Linux-Ubuntu%20%7C%20Debian-E95420?style=flat-square&logo=linux&logoColor=white)
 ![No dependencies](https://img.shields.io/badge/dependencies-none-2e7d4a?style=flat-square)
 
 <table>
@@ -27,6 +29,17 @@ Separate logins side by side, one click to add or switch, and nothing to sign ou
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/macos-switcher-dark.png">
   <img src="docs/images/macos-switcher-light.png" alt="Claude Profile Switcher on macOS: four Claude accounts, two open, with Open, Switch to and Quit buttons" width="340">
+</picture>
+</td>
+</tr>
+<tr>
+<td colspan="2" align="center"><b>Linux</b></td>
+</tr>
+<tr>
+<td colspan="2" align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/linux-switcher-dark.png">
+  <img src="docs/images/linux-switcher-light.png" alt="Claude Profile Switcher on Linux: a GTK window with four Claude accounts, two open, with Open, Switch to and Quit buttons" width="430">
 </picture>
 </td>
 </tr>
@@ -64,35 +77,56 @@ Or clear that flag in Terminal:
 xattr -dr com.apple.quarantine "/Applications/Claude Profile Switcher.app"
 ```
 
-It lives in the menu bar.
+It lives in the menu bar, and updates itself from **Check for Updates...** there.
+
+### Linux (Ubuntu 22.04+, Debian 12+ and others)
+
+It works with Anthropic's [Claude Desktop for Linux](https://claude.com/download) (beta, the
+`claude-desktop` package) and with the community `claude-desktop-unofficial` build. On Ubuntu
+or Debian, download **[claude-profile-switcher_all.deb](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/releases/latest/download/claude-profile-switcher_all.deb)**
+and install it:
+
+```bash
+sudo apt install ./claude-profile-switcher_all.deb
+```
+
+On any other distribution, or without sudo, install it for your user only:
+
+```bash
+curl -fsSL https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/releases/latest/download/ClaudeProfileSwitcher-linux.tar.gz | tar -xz && sh ClaudeProfileSwitcher-linux/install.sh
+```
+
+Then open **Claude Profile Switcher** from the app menu, or run `claude-switcher`.
 
 ## Add your second account in three steps
 
-1. Click **Add account** (Windows) or **Add Account** (macOS, also in the menu bar).
+1. Click **Add Account** in the switcher (also in the macOS menu bar).
 2. A new Claude window opens at the sign-in screen. Sign in with your other account.
-3. Done. Both accounts stay signed in from now on. Give the new one a name like `Work`:
-   **Edit...** or <kbd>F2</kbd> on Windows, **More > Rename...** on macOS.
+3. Done. Both accounts stay signed in from now on. Give the new one a name like `Work`
+   with **Edit...**: <kbd>F2</kbd> on Windows, under **More** on macOS, under **⋮** on Linux.
 
 From then on, **Launch** opens an account, or brings it to the front if it is already open.
 
 ## Features
 
-| | Windows | macOS |
-| --- | :---: | :---: |
-| Several accounts open at once, each with its own login | ✓ | ✓ |
-| One-click **Add account**, straight to the sign-in screen | ✓ | ✓ |
-| Switch to, quit or restart any account | ✓ | ✓ |
-| Rename, colour badge, delete | ✓ | ✓ |
-| Per-account environment variables and launch flags | ✓ | ✓ |
-| Tray or menu bar access, keyboard shortcuts | ✓ | ✓ |
-| Command line for scripts | ✓ | ✓ |
-| Your original account is never touched | ✓ | ✓ |
-| Each account gets its own taskbar button and badged icon | ✓ | Dock icon per account |
-| Browser sign-ins go to the account that asked | ✓ | |
-| Move Claude Code chats between accounts | ✓ | |
-| Reopen accounts after Claude's own auto-update closes them | ✓ | |
-| Desktop and Start menu shortcuts per account | ✓ | |
-| Self-update | ✓ | |
+| | Windows | macOS | Linux |
+| --- | :---: | :---: | :---: |
+| Several accounts open at once, each with its own login | ✓ | ✓ | ✓ |
+| One-click **Add Account**, straight to the sign-in screen | ✓ | ✓ | ✓ |
+| Switch to, quit or restart any account | ✓ | ✓ | ✓ |
+| **Edit**: name, colour badge, environment variables, launch flags | ✓ | ✓ | ✓ |
+| Browser sign-ins go to the account that asked | ✓ | ✓ | ✓ |
+| Move Claude Code chats between accounts | ✓ | ✓ | ✓ |
+| Each account has its own taskbar or Dock entry | ✓ | ✓ | ✓ |
+| Launchers per account | Desktop, Start menu | | App menu, dock actions |
+| Reopen accounts after Claude's own auto-update closes them | ✓ | ✓ | not needed¹ |
+| Tray or menu bar, start at login | ✓ | ✓ | |
+| Self-update, checksum verified | ✓ | ✓ | ✓² |
+| Diagnostics, clean uninstall, command line | ✓ | ✓ | ✓ |
+| Your original account is never touched | ✓ | ✓ | ✓ |
+
+¹ Claude for Linux does not update itself while running; updates come with `apt upgrade`.
+² For a per-user install. The .deb is updated by installing the new .deb.
 
 ## Windows guide
 
@@ -196,20 +230,56 @@ build starts through Windows and takes neither.
 
 The switcher sits in the menu bar. Its menu lists every account with its badge (open ones are
 ticked) and <kbd>⌘</kbd>+<kbd>1</kbd>..<kbd>9</kbd> to open them, plus **Add Account**
-(<kbd>⌘</kbd>+<kbd>N</kbd>), **Quit Account** and **Show Accounts...**. The window has
-**Open** / **Switch to** and **Quit** for each account, and **More** for Rename, Restart,
-Show in Finder and Delete. Each open account gets its own Dock icon.
+(<kbd>⌘</kbd>+<kbd>N</kbd>), **Quit Account**, **Show Accounts...**, **Open at Login**,
+**Send Sign-ins to the Right Account** and **Check for Updates...**. The window has
+**Open** / **Switch to** and **Quit** for each account, and **More** for Edit, Restart,
+Transfer Code Chats, Show in Finder and Delete. Each open account gets its own Dock icon.
 
-Your original account uses Claude's own data in `~/Library/Application Support/Claude`, which
-the switcher never touches. Extra accounts live in
-`~/Library/Application Support/ClaudeProfiles/<name>`, with `settings.json` beside them using
-the same keys as on Windows, so per-account `ProfileEnv` and `ProfileArgs` work the same way.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/macos-edit-dark.png">
+  <img src="docs/images/macos-edit-light.png" alt="The macOS Edit dialog: name, badge colour, environment variables, launch flags and Keep running" width="340">
+</picture>
 
-The app is one Swift file with no dependencies; `macos/build.sh` builds it. The macOS version
-is new: it is built and tested on every change against a stand-in Claude (the screenshot above
-comes from that run, hence its "Claude 9.9.9"), but not yet against the real Claude on a real
-Mac. Please [open an issue](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/issues)
-with what you see.
+- **Sign-ins.** With **Send Sign-ins to the Right Account** on, the switcher handles
+  `claude://` links and hands each sign-in to the account waiting for it, as on Windows.
+  macOS asks once whether the switcher may control Claude: allow it, since that is how the
+  link reaches the right copy.
+- **Keep running** (in **Edit...**) reopens an account when a Claude update, a logoff or a
+  restart closed it, through a per-user launch agent that checks every two minutes.
+- Your original account uses Claude's own data in `~/Library/Application Support/Claude`, which
+  the switcher never touches. Extra accounts live in
+  `~/Library/Application Support/ClaudeProfiles/<name>`, with `settings.json` beside them using
+  the same keys as on Windows.
+
+The app is one Swift file with no dependencies; `macos/build.sh` builds it. It is built and
+tested on every change against a stand-in Claude (the screenshots come from that run), but
+not yet against the real Claude on a real Mac. Please
+[open an issue](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/issues) with
+what you see.
+
+## Linux guide
+
+Run **Claude Profile Switcher** from the app menu. The window lists every account with
+**Open** / **Switch to** and **Quit**, and **⋮** for Edit, Restart, Transfer Code Chats, Open
+Folder and Delete. The **☰** menu turns on sign-in routing and **Show Accounts in the App
+Menu**, which gives each account its own launcher and coloured icon and lists them all as
+quick actions when you right-click the switcher in the dock.
+
+<img src="docs/images/linux-edit-light.png" alt="The Linux Edit dialog: name, badge colour, environment variables and launch flags" width="340">
+
+- **Its own taskbar entry.** Each account runs with a window class of its own, so it is not
+  grouped with your other Claude windows, and pinning it keeps that account.
+- **Sign-ins.** With routing on, the switcher is the `claude://` handler (in your
+  `~/.config/mimeapps.list`, with the previous handler restored on **--revert**), and hands
+  each sign-in to the account waiting for it.
+- Your original account is Claude's own `~/.config/Claude`. Extra accounts live in
+  `~/.config/ClaudeProfiles/<name>`, with the same `settings.json` keys as everywhere else.
+- The window needs GTK 3 for Python (`python3-gi`), which Ubuntu and Debian desktops include.
+  Everything also works from the command line.
+
+Claude for Linux is a beta from Anthropic. The switcher is tested on every change on Ubuntu
+against a stand-in Claude that behaves like Electron, but not yet against the real beta.
+Reports are very welcome.
 
 ## Command line
 
@@ -247,7 +317,34 @@ Names can be an account's label or its folder name.
 | `--list` | Accounts and which are open |
 | `--rename Work Client` | Rename (the folder and sign-in stay) |
 | `--delete Work` | Delete an account and its folder |
+| `--chats Work` / `--transfer Work Personal --all` | List Claude Code chats / copy them to another account |
+| `--keep-running Work` / `--stop-keeping Work` | Reopen it after Claude's updates, or stop |
+| `--route-sign-ins` / `--revert` / `--status` | Sign-in routing on, off, and its state |
+| `--open-link <url> --account Work` / `--open-links-in Work` | Open one `claude://` link there / send other links there |
+| `--open-at-login on\|off` | Start the switcher at login |
+| `--check-update` / `--update` | Look for / install the latest release |
+| `--doctor` / `--uninstall [--remove-profiles]` | Bug report details / remove what it made |
 | `--claude-path <app>` / `--version` | Use this Claude.app / print the version |
+</details>
+
+<details>
+<summary><b>Linux</b> (<code>claude-switcher</code>)</summary>
+
+| Command | Does |
+| --- | --- |
+| `--add-account` | Add an account and open Claude at its sign-in screen |
+| `--launch Work` | Open an account, or bring it forward if it is open |
+| `--quit Work` / `--restart Work` | Quit its Claude / quit it and open it again |
+| `--list` | Accounts and which are open |
+| `--rename Work Client` / `--delete Work` | Rename (folder and sign-in stay) / delete |
+| `--edit Work --color 2 --flags=--lang=en-GB --env K=V` | Change colour, flags or variables |
+| `--chats Work` / `--transfer Work Personal --all` | List Claude Code chats / copy them to another account |
+| `--install-launchers` / `--remove-launchers` | Put each account in the app menu, or take them out |
+| `--route-sign-ins` / `--revert` / `--status` | Sign-in routing on, off, and its state |
+| `--open-link <url> --account Work` / `--open-links-in Work` | Open one `claude://` link there / send other links there |
+| `--check-update` / `--update` | Look for / install the latest release |
+| `--doctor` / `--uninstall [--remove-profiles]` | Bug report details / remove what it made |
+| `--claude-path <path>` / `--version` | Use this Claude / print the version |
 </details>
 
 ## How it works
@@ -296,6 +393,22 @@ or tokens: you sign in to each account in Claude itself.
   daily check off. See [SECURITY.md](SECURITY.md) for everything the switcher writes or reads.
 </details>
 
+<details>
+<summary><b>macOS and Linux details</b></summary>
+
+- **Running detection** reads each process's arguments: an account is the Claude process
+  started with its folder, and Electron's helper processes (`--type=...`) are not counted.
+- **Sign-in routing** works the same way everywhere: the account started while signed out,
+  else the only open account that is signed out (read from its `config.json`, key presence and
+  length only), else the one whose window was used last, else your original account. On macOS
+  the link is handed over as an Apple Event to that account's process; on Linux, by starting
+  that account's Claude with the link, which Electron's single-instance lock passes to the copy
+  already open. Claude making itself the handler again as it starts is undone at once.
+- **Updates** look at where GitHub's "latest release" points, once a day, and install the new
+  app or program only when it matches the release's `SHA256SUMS.txt` (and on macOS, passes
+  `codesign --verify` and carries the same bundle id).
+</details>
+
 ## FAQ
 
 <details>
@@ -308,9 +421,9 @@ can have a work and a personal account (or several) open and signed in at once.
 <details>
 <summary><b>Does it work with Claude Code in the desktop app?</b></summary>
 
-Yes. Each account has its own Code tab and sessions. On Windows you can also copy Code chats
-from one account to another, and keep accounts that run long Code sessions open through
-Claude's updates.
+Yes. Each account has its own Code tab and sessions. You can also copy Code chats from one
+account to another, and on Windows and macOS keep accounts that run long Code sessions open
+through Claude's updates.
 </details>
 
 <details>
@@ -348,7 +461,15 @@ This is for the desktop app. The `claude` CLI already supports several accounts 
 <summary><b>Claude cannot be found</b></summary>
 
 Point at it once and it is remembered: `-ClaudePath C:\path\to\Claude.exe` on Windows,
-`--claude-path /path/to/Claude.app` on macOS.
+`--claude-path /path/to/Claude.app` on macOS, `--claude-path /path/to/claude-desktop` on Linux.
+On Linux the switcher looks for the `claude-desktop` and `claude-desktop-unofficial` commands.
+</details>
+
+<details>
+<summary><b>The window does not open (Linux)</b></summary>
+
+It needs GTK 3 for Python: `sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0`.
+Everything else works without it from the command line.
 </details>
 
 <details>
@@ -388,8 +509,10 @@ recent log lines, with your user name replaced.
 
 Windows: the tray's **Uninstall...**, or `-Uninstall`. That removes shortcuts, the watchdog task,
 sign-in routing and the installed copy, and keeps your accounts and settings unless you add
-`-RemoveProfiles`. macOS: quit it from the menu bar and move the app to the Bin; extra accounts
-are in `~/Library/Application Support/ClaudeProfiles`.
+`-RemoveProfiles`. macOS: run `--uninstall` (launch agents and sign-in routing), quit it from
+the menu bar and move the app to the Bin. Linux: `claude-switcher --uninstall`, then
+`sudo apt remove claude-profile-switcher` for the .deb. On both, accounts stay unless you add
+`--remove-profiles`.
 </details>
 
 ## What has been verified
@@ -400,10 +523,16 @@ are in `~/Library/Application Support/ClaudeProfiles`.
   suites run on every change in Windows PowerShell 5.1 and PowerShell 7. The installer build
   of Claude, and chat transfer between two real accounts, have not been tried yet.
 - **macOS:** built for Apple Silicon and Intel and tested end to end on every change against a
-  stand-in Claude: adding, opening, switching, flags and variables, rename, quit, delete, all
-  in a folder path with spaces. Not yet run against the real Claude on a real Mac.
+  stand-in Claude: adding, opening, switching, flags and variables, rename, quit, delete, chat
+  transfer, keep running through its launch agent, sign-in routing, self-update with a tampered
+  checksum, all in a folder path with spaces. Not yet run against the real Claude on a real Mac.
+- **Linux:** tested end to end on every change on Ubuntu against a stand-in Claude that starts
+  Electron-style helper processes and hands a second start to the first copy: accounts, edit,
+  chat transfer, app menu launchers (validated), sign-in routing including a link opened
+  through the desktop, self-update, and installing the .deb and the tarball. Not yet run
+  against Anthropic's real Linux beta.
 
-Reports from either of those untested setups are the most useful contribution anyone can make
+Reports from any of those untested setups are the most useful contribution anyone can make
 right now.
 
 ## Star history
