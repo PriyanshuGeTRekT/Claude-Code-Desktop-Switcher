@@ -105,6 +105,14 @@ jobs:
         shell: pwsh
         run: .\tests\Watchdog.Tests.ps1
 
+      - name: Launcher and doctor tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\Launcher.Tests.ps1
+
+      - name: Launcher and doctor tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\Launcher.Tests.ps1
+
       - name: Install PSScriptAnalyzer
         shell: pwsh
         run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck

@@ -100,6 +100,24 @@
 .PARAMETER RemoveWatchdog
     Delete that task. The kept-running choices stay in settings.json.
 
+.PARAMETER ShortcutStyle
+    How shortcuts (and the taskbar, claude:// and watchdog launchers) start the switcher:
+    headless (default), hidden, or plain. For antivirus products that delete the default
+    shape. Remakes every shortcut.
+
+.PARAMETER Uninstall
+    Remove everything the switcher put outside its profiles: shortcuts, the watchdog task,
+    sign-in routing, the installed copy. Accounts stay signed in in their folders.
+
+.PARAMETER RemoveProfiles
+    With -Uninstall: delete the extra accounts' folders too, which signs them out here,
+    and the settings.
+
+.PARAMETER Doctor
+    Print what a bug report needs: versions, where Claude is, each account's state, the
+    routing, update and watchdog state, and the last lines of each log. Your Windows user
+    name is replaced with <user>.
+
 .EXAMPLE
     .\ClaudeSwitcher.ps1
     .\ClaudeSwitcher.ps1 -Launch Work
@@ -140,7 +158,11 @@ param(
     [string]$StopKeeping,
     [switch]$Watch,
     [switch]$InstallWatchdog,
-    [switch]$RemoveWatchdog
+    [switch]$RemoveWatchdog,
+    [string]$ShortcutStyle,
+    [switch]$Uninstall,
+    [switch]$RemoveProfiles,
+    [switch]$Doctor
 )
 
 $ErrorActionPreference = 'Stop'
@@ -510,7 +532,17 @@ if ($Update) {
     return
 }
 
-Update-ClaudeInstall -AllowCache:([bool]$Launch -or [bool]$HandleLink -or [bool]$OpenLink)
+$script:ResolveError = $null
+try {
+    Update-ClaudeInstall -AllowCache:([bool]$Launch -or [bool]$HandleLink -or [bool]$OpenLink)
+} catch {
+    # -Doctor is for exactly this situation too, so it carries on with what it has.
+    if (-not $Doctor) { throw }
+    $script:ResolveError      = $_.Exception.Message
+    $script:ClaudeApp          = New-InstallInfo 'not found' '' 'unknown' $null (Join-Path $env:APPDATA 'Claude')
+    $script:ClaudeExe          = ''
+    $script:DefaultProfilePath = $script:ClaudeApp.DefaultProfilePath
+}
 if ($ClaudePath) { Set-Setting 'ClaudePath' $script:ClaudeApp.Exe }
 
 # ------------------------------------------------------------------- native --
@@ -1342,13 +1374,8 @@ function Get-ProfileAumid {
 function Get-ProfileRelaunchCommand {
     # What a pinned taskbar button runs: the same launcher as the profile's shortcuts.
     param([Parameter(Mandatory)]$Target)
-    $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
-    $cmd     = "-NoProfile -ExecutionPolicy Bypass -File `"$(Get-LauncherScript)`" -Launch `"$($Target.Id)`""
-    if ([Environment]::OSVersion.Version.Build -ge 17763 -and (Test-Path -LiteralPath $conhost)) {
-        return "`"$conhost`" --headless `"$ps`" $cmd"
-    }
-    return "`"$ps`" -WindowStyle Hidden $cmd"
+    $cmd = Get-LauncherCommand -ScriptArgs "-Launch `"$($Target.Id)`""
+    return "`"$($cmd.Execute)`" $($cmd.Argument)"
 }
 
 # Icon handles live as long as this process: a window draws with the handle it was given,
@@ -1461,25 +1488,43 @@ function Get-LauncherScript {
     return $script:ScriptPath
 }
 
-function Set-LauncherTarget {
-    param([Parameter(Mandatory)]$Link, [string]$ScriptArgs, [switch]$Window)
+$script:ShortcutStyles = @('headless', 'hidden', 'plain')
+
+function Get-ShortcutStyle {
+    $style = [string](Get-Setting 'ShortcutStyle')
+    if ($script:ShortcutStyles -contains $style) { return $style }
+    return 'headless'
+}
+
+# How everything that starts this script is built: shortcuts, the taskbar relaunch
+# command, the claude:// handler and the watchdog task. The style comes from settings.json:
+#   headless  conhost --headless powershell ...: nothing flashes on screen, and no hidden
+#             show state lands in STARTUPINFO for the windows we open afterwards to inherit.
+#   hidden    powershell -WindowStyle Hidden ...: no conhost; a console may flicker.
+#   plain     hidden, without -ExecutionPolicy Bypass: needs a policy that runs the
+#             installed copy, such as RemoteSigned (-Install unblocks the file).
+# Some antivirus products delete the first shape as a trojan pattern (issue #10); the
+# others exist for them. Returns Execute, Argument and, for a visible console, WindowStyle.
+function Get-LauncherCommand {
+    param([string]$ScriptArgs, [switch]$Visible)
     $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
-    $cmd     = ("-NoProfile -ExecutionPolicy Bypass -File `"$(Get-LauncherScript)`" $ScriptArgs").TrimEnd()
-    if ([Environment]::OSVersion.Version.Build -ge 17763 -and (Test-Path -LiteralPath $conhost)) {
-        # A headless console host gives PowerShell a console that never becomes a window,
-        # so nothing flashes on screen. Unlike -WindowStyle Hidden it also puts no hidden
-        # show state into STARTUPINFO for the windows we open afterwards to inherit.
-        $Link.TargetPath = $conhost
-        $Link.Arguments  = "--headless `"$ps`" $cmd"
-    } elseif ($Window) {
-        $Link.TargetPath  = $ps
-        $Link.Arguments   = $cmd
-        $Link.WindowStyle = 7   # minimised, so the console never flashes into view
-    } else {
-        $Link.TargetPath = $ps
-        $Link.Arguments  = "-WindowStyle Hidden $cmd"
+    $style   = Get-ShortcutStyle
+    $policy  = $(if ($style -eq 'plain') { '' } else { '-ExecutionPolicy Bypass ' })
+    $cmd     = ("-NoProfile $policy-File `"$(Get-LauncherScript)`" $ScriptArgs").TrimEnd()
+    if ($style -eq 'headless' -and [Environment]::OSVersion.Version.Build -ge 17763 -and (Test-Path -LiteralPath $conhost)) {
+        return @{ Execute = $conhost; Argument = "--headless `"$ps`" $cmd"; WindowStyle = $null }
     }
+    if ($Visible) { return @{ Execute = $ps; Argument = $cmd; WindowStyle = 7 } }   # minimised, so the console never flashes into view
+    return @{ Execute = $ps; Argument = "-WindowStyle Hidden $cmd"; WindowStyle = $null }
+}
+
+function Set-LauncherTarget {
+    param([Parameter(Mandatory)]$Link, [string]$ScriptArgs, [switch]$Window)
+    $cmd = Get-LauncherCommand -ScriptArgs $ScriptArgs -Visible:$Window
+    $Link.TargetPath = $cmd.Execute
+    $Link.Arguments  = $cmd.Argument
+    if ($cmd.WindowStyle) { $Link.WindowStyle = $cmd.WindowStyle }
 }
 
 function New-ProfileShortcut {
@@ -1558,14 +1603,9 @@ function New-AddAccountShortcut {
 }
 
 function Start-SwitcherWindow {
-    $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
-    $cmd     = "-NoProfile -ExecutionPolicy Bypass -File `"$(Get-LauncherScript)`""
-    if ([Environment]::OSVersion.Version.Build -ge 17763 -and (Test-Path -LiteralPath $conhost)) {
-        Start-Process -FilePath $conhost -ArgumentList "--headless `"$ps`" $cmd"
-    } else {
-        Start-Process -FilePath $ps -ArgumentList $cmd -WindowStyle Minimized
-    }
+    $cmd = Get-LauncherCommand -Visible
+    if ($cmd.WindowStyle) { Start-Process -FilePath $cmd.Execute -ArgumentList $cmd.Argument -WindowStyle Minimized }
+    else { Start-Process -FilePath $cmd.Execute -ArgumentList $cmd.Argument }
 }
 
 function Get-StartupShortcutPath {
@@ -1766,13 +1806,7 @@ function Invoke-Watchdog {
 
 # The task's command: a headless console, this script, -Watch, like the shortcuts.
 function Get-WatchdogCommand {
-    $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
-    $cmd     = "-NoProfile -ExecutionPolicy Bypass -File `"$(Get-LauncherScript)`" -Watch"
-    if ([Environment]::OSVersion.Version.Build -ge 17763 -and (Test-Path -LiteralPath $conhost)) {
-        return @{ Execute = $conhost; Argument = "--headless `"$ps`" $cmd" }
-    }
-    return @{ Execute = $ps; Argument = "-WindowStyle Hidden $cmd" }
+    return (Get-LauncherCommand -ScriptArgs '-Watch')
 }
 
 function Test-WatchdogInstalled {
@@ -1806,6 +1840,108 @@ function Remove-Watchdog {
 # The task exists exactly while some account is kept running.
 function Sync-Watchdog {
     if ((Get-KeptProfiles).Count) { Install-Watchdog } else { Remove-Watchdog }
+}
+
+# ---------------------------------------------------- uninstall and doctor --
+
+# Undoes everything the switcher put outside its profiles. Returns one line per thing
+# done. Accounts and settings.json stay unless RemoveProfiles asks for them to go.
+function Uninstall-Switcher {
+    param([switch]$RemoveProfiles)
+    $done = New-Object System.Collections.Generic.List[string]
+    # Routing first: Windows may be pointing claude:// links at the installed copy.
+    if ((Test-SignInRoutingOn) -or (Test-Path -LiteralPath (Get-RouterRegistryPath).ProgId)) {
+        try { foreach ($line in @(Disable-SignInRouting)) { $done.Add($line) } }
+        catch { $done.Add("could not put the claude:// handler back: $($_.Exception.Message)") }
+    }
+    try { if (Test-WatchdogInstalled) { Remove-Watchdog; $done.Add("removed the task '$($script:WatchdogTaskName)'") } }
+    catch { $done.Add("could not remove the watchdog task: $($_.Exception.Message)") }
+    foreach ($dir in @(Get-ShortcutDirs) + @([Environment]::GetFolderPath('Startup'))) {
+        foreach ($name in 'Claude Profile Switcher.lnk', 'Claude - Add account.lnk') {
+            $f = Join-Path $dir $name
+            if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force; $done.Add("removed $f") }
+        }
+    }
+    foreach ($p in @(Get-ProfileList -SkipStatus)) {
+        foreach ($f in @(Remove-ProfileShortcuts -Label $p.Name)) { $done.Add("removed $f") }
+    }
+    if ($RemoveProfiles) {
+        foreach ($p in @(Get-ProfileList | Where-Object { -not $_.IsDefault })) {
+            try { Remove-ClaudeProfile -Target $p; $done.Add("deleted the account '$($p.Name)' and its folder") }
+            catch { $done.Add("kept '$($p.Name)': $($_.Exception.Message)") }
+        }
+    }
+    # The switcher's own folder holds the installed copy, which may be this very script.
+    # Windows can delete a script that is running, but not a folder that is some process's
+    # working directory, which shortcuts make it.
+    try { Set-Location -LiteralPath $env:USERPROFILE } catch { }
+    if (Test-Path -LiteralPath $script:SwitcherHome) {
+        Remove-Item -LiteralPath $script:SwitcherHome -Recurse -Force
+        $done.Add("removed $($script:SwitcherHome) (installed copy, icons, logs)")
+    }
+    if ($RemoveProfiles) {
+        foreach ($f in $script:SettingsPath, $script:LogPath) {
+            if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force; $done.Add("removed $f") }
+        }
+        $leftover = @(Get-ChildItem -LiteralPath $script:ProfileRoot -Force -ErrorAction SilentlyContinue)
+        if ((Test-Path -LiteralPath $script:ProfileRoot) -and -not $leftover.Count) { Remove-Item -LiteralPath $script:ProfileRoot -Force; $done.Add("removed $($script:ProfileRoot)") }
+    } else {
+        $done.Add("kept your accounts and $($script:SettingsPath); add -RemoveProfiles to delete them")
+    }
+    return $done
+}
+
+# Replaces the Windows user name in a block of text, the one thing in paths that
+# identifies a reporter (the issue templates ask for that).
+function Hide-UserName {
+    param([string]$Text)
+    if (-not $env:USERNAME) { return $Text }
+    return ($Text -replace ('(?i)' + [regex]::Escape($env:USERNAME)), '<user>')
+}
+
+function Get-LogTailText {
+    param([Parameter(Mandatory)][string]$Path, [int]$Lines = 5)
+    if (-not (Test-Path -LiteralPath $Path)) { return @("  (no $(Split-Path $Path -Leaf))") }
+    return @(Get-Content -LiteralPath $Path -Tail $Lines -ErrorAction SilentlyContinue | ForEach-Object { "  $_" })
+}
+
+# What a bug report needs, in one block.
+function Get-Diagnostics {
+    $out = New-Object System.Collections.Generic.List[string]
+    $out.Add("Claude Profile Switcher $($script:SwitcherVersion)")
+    $out.Add("Windows $([Environment]::OSVersion.Version), PowerShell $($PSVersionTable.PSVersion)")
+    if ($script:ResolveError) { $out.Add("Claude: NOT FOUND ($($script:ResolveError -replace '\s+', ' '))") }
+    else { $out.Add("Claude: $($script:ClaudeApp.Kind) $($script:ClaudeApp.Version) at $($script:ClaudeExe)") }
+    $out.Add("Script: $($script:ScriptPath)")
+    $out.Add("Installed copy: $(if (Test-Path -LiteralPath $script:InstalledScript) { $script:InstalledScript } else { 'none' })")
+    $out.Add("Shortcut style: $(Get-ShortcutStyle)")
+    try { $out.Add("Sign-in routing: $(Get-RouterStateText)") } catch { $out.Add("Sign-in routing: could not read ($($_.Exception.Message))") }
+    try { $out.Add("Other links: $(if ($o = Get-OtherLinkTarget) { "open in '$($o.Name)'" } else { 'open in Default' })") } catch { }
+    $out.Add("Watchdog task: $(if (Test-WatchdogInstalled) { 'installed' } else { 'not installed' })")
+    $out.Add("Update note: $(if (Test-Path -LiteralPath $script:UpdateInfoPath) { (Get-Content -LiteralPath $script:UpdateInfoPath -Raw) -replace '\s+', ' ' } else { 'none' })")
+    $out.Add('')
+    $out.Add('Accounts:')
+    try {
+        $kept = Get-KeptProfiles
+        foreach ($p in @(Get-ProfileList)) {
+            $flags = @()
+            if ($p.IsDefault) { $flags += 'original' }
+            if ($kept[$p.Id]) { $flags += 'kept running' }
+            # Built apart: inside .Add( ) the commas after -f would be read as more arguments to Add.
+            $line = "  {0,-24} {1,-11} {2}{3}" -f "$($p.Name)$(if ($p.Name -ne $p.Id) { " [$($p.Id)]" })", $(if ($p.Pid) { "pid $($p.Pid)" } else { 'stopped' }), $p.Path, $(if ($flags.Count) { "  ($($flags -join ', '))" } else { '' })
+            $out.Add($line)
+        }
+    } catch { $out.Add("  could not list: $($_.Exception.Message)") }
+    foreach ($log in @(
+        @{ Name = 'Errors';   Path = $script:LogPath },
+        @{ Name = 'Router';   Path = $script:RouterLogPath },
+        @{ Name = 'Updates';  Path = $script:UpdateLogPath },
+        @{ Name = 'Watchdog'; Path = $script:WatchdogLogPath })) {
+        $out.Add('')
+        $out.Add("$($log.Name) log, last lines:")
+        foreach ($line in (Get-LogTailText -Path $log.Path)) { $out.Add($line) }
+    }
+    return (Hide-UserName -Text ($out -join "`r`n"))
 }
 
 # ------------------------------------------------------- Claude Code chats --
@@ -2157,14 +2293,9 @@ function Wait-LaunchedIdentity {
 }
 
 function Get-RouterCommand {
-    # Same launcher as the shortcuts: a headless console host, so nothing flashes on screen.
-    $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
-    $cmd     = "-NoProfile -ExecutionPolicy Bypass -File `"$(Get-LauncherScript)`" -HandleLink `"%1`""
-    if ([Environment]::OSVersion.Version.Build -ge 17763 -and (Test-Path -LiteralPath $conhost)) {
-        return "`"$conhost`" --headless `"$ps`" $cmd"
-    }
-    return "`"$ps`" -WindowStyle Hidden $cmd"
+    # Same launcher as the shortcuts.
+    $cmd = Get-LauncherCommand -ScriptArgs '-HandleLink "%1"'
+    return "`"$($cmd.Execute)`" $($cmd.Argument)"
 }
 
 function Get-RegistryDefault {
@@ -2667,6 +2798,31 @@ if ($RemoveWatchdog) {
     return
 }
 
+if ($ShortcutStyle) {
+    if ($script:ShortcutStyles -notcontains $ShortcutStyle) { throw "Unknown style '$ShortcutStyle'. Use one of: $($script:ShortcutStyles -join ', ')." }
+    Set-Setting 'ShortcutStyle' $ShortcutStyle
+    # Everything built from the launcher is made again: shortcuts, the handler, the task.
+    Install-Switcher
+    if (Test-SignInRoutingOn) { try { Register-SignInRouter } catch { } }
+    if (Test-WatchdogInstalled) { try { Install-Watchdog } catch { } }
+    "Shortcuts now use the '$ShortcutStyle' style and were made again."
+    if ($ShortcutStyle -eq 'plain') {
+        'This style runs PowerShell without -ExecutionPolicy Bypass, so your policy has to allow the installed copy. If shortcuts do nothing, run once:'
+        '    Set-ExecutionPolicy -Scope CurrentUser RemoteSigned'
+    }
+    return
+}
+
+if ($Uninstall) {
+    foreach ($line in @(Uninstall-Switcher -RemoveProfiles:$RemoveProfiles)) { "- $line" }
+    return
+}
+
+if ($Doctor) {
+    Get-Diagnostics
+    return
+}
+
 if ($Shortcut) {
     $target = Resolve-ClaudeProfile -Name $Shortcut -SkipStatus
     if (-not $target) { throw "There is no Claude profile called '$Shortcut'." }
@@ -3121,6 +3277,28 @@ function Invoke-UpdateSwitcher {
     }
     # Started again from the finally block, once this copy has let go of the mutex.
     $script:RestartAfterExit = $true
+    Exit-Switcher
+}
+
+function Invoke-CopyDiagnostics {
+    try {
+        Set-Clipboard -Value (Get-Diagnostics)
+        $statusLine.Text = 'Diagnostics copied. Paste them into a GitHub issue; your user name is replaced.'
+    } catch {
+        Show-Message $_.Exception.Message 'Could not copy' 'OK' 'Warning' | Out-Null
+    }
+}
+
+function Invoke-UninstallSwitcher {
+    $answer = Show-Message "Remove the switcher's shortcuts, its watchdog task, sign-in routing and its installed copy?`n`nYour accounts stay signed in, in their folders, and settings.json is kept. Delete those by hand, or run -Uninstall -RemoveProfiles." 'Uninstall' 'YesNo' 'Warning'
+    if ($answer -ne 'Yes') { return }
+    try {
+        $done = @(Uninstall-Switcher)
+        Show-Message ("Done:`n`n- " + ($done -join "`n- ")) 'Uninstall' | Out-Null
+    } catch {
+        Show-Message $_.Exception.Message 'Uninstall' 'OK' 'Error' | Out-Null
+        return
+    }
     Exit-Switcher
 }
 
@@ -3623,6 +3801,8 @@ $trayMenu.Add_Opening({
     $trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
     $upd = Add-MenuItem $trayMenu $(if ($script:UpdateAvailable) { "Update to $($script:UpdateAvailable)..." } else { 'Check for updates...' }) { Invoke-UpdateSwitcher }
     if ($script:UpdateAvailable) { $upd.Font = $fontBold }
+    $null = Add-MenuItem $trayMenu 'Copy diagnostics' { Invoke-CopyDiagnostics }
+    $null = Add-MenuItem $trayMenu 'Uninstall...' { Invoke-UninstallSwitcher }
     $null = Add-MenuItem $trayMenu 'Exit' { Exit-Switcher }
     $_.Cancel = $false
 })
