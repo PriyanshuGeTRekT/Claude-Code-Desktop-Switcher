@@ -110,6 +110,8 @@ sleep 1
 last="$(grep -F "ClaudeProfiles/Account 2" "$log" | tail -1)"
 check "restart passed the folder, then each flag as its own argument" 'echo "$last" | grep -qF "Account 2|--lang|a b]"'
 check "restart passed the environment variable" 'echo "$last" | grep -qF "MY_PEER=[peer-2]"'
+sw --rename "Account 2" "Account 2b" >/dev/null; sw --rename "Account 2" "Account 2" >/dev/null
+check "settings.json, which can hold tokens, is readable by its owner only" '[ "$(stat -f %Lp "$P/settings.json")" = 600 ]'
 
 echo "== rename, quit, delete"
 out="$(sw --rename "Account 2" Work)"
