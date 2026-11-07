@@ -708,7 +708,7 @@ enum Maintenance {
         // watchdog back.
         if !Watchdog.kept().isEmpty { try? Settings.set("KeepRunning", nil); done.append("stopped keeping accounts running") }
         if Router.isOn() || Router.isOurs() {
-            do { try Router.disable(); done.append("gave claude:// links back to Claude") }
+            do { let note = try Router.disable(); done.append(note.map { "turned sign-in routing off. \($0)" } ?? "gave claude:// links back to Claude") }
             catch { done.append("could not give claude:// links back to Claude: \(error.localizedDescription)") }
         }
         for label in [Agents.watchdogLabel, Agents.loginLabel] where Agents.isInstalled(label) {
@@ -948,7 +948,7 @@ enum Router {
             if let u = handlerURL(), Bundle(url: u)?.bundleIdentifier == id { return }
             Thread.sleep(forTimeInterval: 0.25)
         }
-        throw SwitcherError("macOS kept \(handlerName()) as the claude:// handler.")
+        throw SwitcherError("macOS kept \(handlerName()) as the claude:// handler" + (failure.map { " (\($0.localizedDescription))" } ?? "") + ".")
     }
 
     static func enable() throws {
@@ -958,10 +958,18 @@ enum Router {
         try setHandler(me)
     }
 
-    static func disable() throws {
+    /// Returns a note when macOS kept the switcher as the handler (it can ask the user
+    /// first). Nothing is lost: with routing off every link goes on to Default, and Claude
+    /// makes itself the handler again the next time it starts.
+    @discardableResult
+    static func disable() throws -> String? {
         try Settings.set("SignInRouting", nil)
         clearPending()
-        if isOurs(), let claude = ClaudeApp.find() { try setHandler(claude) }
+        guard isOurs(), let claude = ClaudeApp.find() else { return nil }
+        do { try setHandler(claude) } catch {
+            return "\(error.localizedDescription) Until Claude next starts and takes them back, the switcher passes every link to Default."
+        }
+        return nil
     }
 
     /// Claude makes itself the handler again as it starts; take it back.
@@ -1900,8 +1908,9 @@ func runCommandLine(_ args: [String]) throws -> Bool {
         return true
     }
     if args.contains("--revert") {
-        try Router.disable()
-        print("claude:// links open in: \(Router.handlerName()).")
+        let note = try Router.disable()
+        print("Sign-in routing is off. claude:// links open in: \(Router.handlerName()).")
+        if let n = note { print(n) }
         return true
     }
     if args.contains("--status") { print(Router.statusText()); return true }
