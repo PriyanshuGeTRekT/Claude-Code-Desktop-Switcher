@@ -268,8 +268,9 @@ enum Launcher {
     /// a closed Terminal, and each account gets its own Dock icon. Always -n: without it,
     /// Launch Services only brings forward whichever copy of Claude is already running,
     /// which may be another account. Only an account found not running is started.
-    static func openArguments(app: URL, profile: Profile) -> [String] {
+    static func openArguments(app: URL, profile: Profile, background: Bool = false) -> [String] {
         var a = ["-n", "-a", app.path]
+        if background { a.insert("-g", at: 0) }   // -g: start it without bringing it to the front
         for (k, v) in env(profile.id) { a += ["--env", "\(k)=\(v)"] }
         var pass = profile.isDefault ? [] : ["--user-data-dir=\(profile.dataDir.path)"]
         pass += extraArgs(profile.id)
@@ -279,7 +280,7 @@ enum Launcher {
 
     /// Returns "focused" when the account was already open, "started" otherwise.
     @discardableResult
-    static func start(_ profile: Profile) throws -> String {
+    static func start(_ profile: Profile, background: Bool = false) throws -> String {
         if let pid = profile.pid {
             NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
             return "focused"
@@ -290,7 +291,7 @@ enum Launcher {
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        p.arguments = openArguments(app: app, profile: profile)
+        p.arguments = openArguments(app: app, profile: profile, background: background)
         let err = Pipe()
         p.standardError = err
         p.standardOutput = FileHandle.nullDevice
@@ -355,9 +356,374 @@ enum Accounts {
         }
         if p.pid != nil { try Launcher.stop(p) }
         if FileManager.default.fileExists(atPath: dir.path) { try FileManager.default.removeItem(at: dir) }
-        for key in ["Labels", "Colors", "ChosenColors", "ProfileArgs", "ProfileEnv"] {
+        for key in ["Labels", "Colors", "ChosenColors", "ProfileArgs", "ProfileEnv", "KeepRunning"] {
             try? Settings.setEntry(key, id: p.id, value: nil)
         }
+        try? Watchdog.sync()
+    }
+}
+
+// MARK: - Per-account settings shared with the Windows switcher
+
+enum AccountSettings {
+    /// "NAME=value" lines as typed in the Edit dialog. Blank lines and # comments are
+    /// skipped; anything else without a valid name before the first = is reported back.
+    static func parseEnv(_ text: String) -> (vars: [String: String], invalid: [String]) {
+        var vars: [String: String] = [:]
+        var invalid: [String] = []
+        for raw in text.components(separatedBy: .newlines) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            guard let eq = line.firstIndex(of: "=") else { invalid.append(line); continue }
+            let name = line[..<eq].trimmingCharacters(in: .whitespaces)
+            guard name.range(of: "^[A-Za-z_][A-Za-z0-9_]*$", options: .regularExpression) != nil else { invalid.append(line); continue }
+            vars[name] = String(line[line.index(after: eq)...])
+        }
+        return (vars, invalid)
+    }
+
+    static func envText(_ id: String) -> String {
+        guard let m = Settings.map("ProfileEnv")[id] as? [String: Any] else { return "" }
+        return m.keys.sorted().map { "\($0)=\(m[$0]!)" }.joined(separator: "\n")
+    }
+
+    /// The flags as one line, list items quoted when they hold spaces, so saving them back
+    /// keeps each one a single argument.
+    static func argsText(_ id: String) -> String {
+        let v = Settings.map("ProfileArgs")[id]
+        if let s = v as? String { return s }
+        if let a = v as? [Any] {
+            return a.map { "\($0)" }.map { $0.contains(" ") || $0.contains("\"") ? "\"" + $0.replacingOccurrences(of: "\"", with: "\\\"") + "\"" : $0 }.joined(separator: " ")
+        }
+        return ""
+    }
+
+    static func isKept(_ id: String) -> Bool { (Settings.map("KeepRunning")[id] as? Bool) == true }
+}
+
+// MARK: - Background agents (Open at Login, keep running)
+
+enum Agents {
+    /// A run with its own agents folder (the tests) also gets labels of its own, so it never
+    /// unloads the agents of a real install on the same Mac.
+    static let base = "io.github.priyanshugetrekt.claude-profile-switcher" +
+        ((ProcessInfo.processInfo.environment["CLAUDE_SWITCHER_LAUNCHAGENTS_DIR"] ?? "").isEmpty ? "" : ".test")
+    static let watchdogLabel = base + ".watchdog"
+    static let loginLabel = base + ".login"
+
+    static var dir: URL {
+        if let o = ProcessInfo.processInfo.environment["CLAUDE_SWITCHER_LAUNCHAGENTS_DIR"], !o.isEmpty {
+            return URL(fileURLWithPath: o, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+    }
+
+    static func plistURL(_ label: String) -> URL { dir.appendingPathComponent(label + ".plist") }
+    static func isInstalled(_ label: String) -> Bool { FileManager.default.fileExists(atPath: plistURL(label).path) }
+    static var executable: String { Bundle.main.executablePath ?? CommandLine.arguments[0] }
+
+    @discardableResult
+    static func launchctl(_ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return -1 }
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
+
+    static func isLoaded(_ label: String) -> Bool { launchctl(["print", "gui/\(getuid())/\(label)"]) == 0 }
+
+    /// A per-user launch agent: no admin rights, and launchd starts it again at login.
+    /// Loaded at once only when `load` is set; Open at Login takes effect at the next login.
+    static func install(_ label: String, arguments: [String], interval: Int?, load: Bool) throws {
+        var dict: [String: Any] = ["Label": label, "ProgramArguments": [executable] + arguments,
+                                   "RunAtLoad": true, "ProcessType": label == loginLabel ? "Interactive" : "Background"]
+        if let i = interval { dict["StartInterval"] = i }
+        // The tests keep everything in a folder of their own; an agent has to look there too.
+        var env: [String: String] = [:]
+        for k in ["CLAUDE_SWITCHER_SUPPORT_DIR", "CLAUDE_SWITCHER_APP", "CLAUDE_SWITCHER_LAUNCHAGENTS_DIR"] {
+            if let v = ProcessInfo.processInfo.environment[k], !v.isEmpty { env[k] = v }
+        }
+        if !env.isEmpty { dict["EnvironmentVariables"] = env }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let data = try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
+        try data.write(to: plistURL(label), options: .atomic)
+        guard load else { return }
+        launchctl(["bootout", "gui/\(getuid())/\(label)"])   // an older definition, if any
+        let status = launchctl(["bootstrap", "gui/\(getuid())", plistURL(label).path])
+        if status != 0 { throw SwitcherError("launchctl could not load \(label) (status \(status)). Its file is \(plistURL(label).path).") }
+    }
+
+    static func remove(_ label: String) {
+        launchctl(["bootout", "gui/\(getuid())/\(label)"])
+        try? FileManager.default.removeItem(at: plistURL(label))
+    }
+}
+
+// MARK: - Keeping accounts open
+
+/*
+    An account marked KeepRunning is reopened when something other than its user closed
+    it: Claude updating itself, a logoff, a restart. A launch agent runs --watch every two
+    minutes and at login. It acts only when the account's own main.log ends in a forced
+    close, never after a quit by the user, and never twice within ten minutes. The markers
+    were seen in the Windows build's logs (issue #9); "no recognisable line" means leave it,
+    so a rename on Anthropic's side fails safe.
+*/
+enum Watchdog {
+    static let userQuitMarkers = ["beforeQuit: handler fired", "willQuit: handler fired"]
+    static let forcedMarkers = ["Windows session ending", "going down for update", "beforeQuitForUpdate", "[stealth-update]", "quitAndInstall"]
+    static var home: URL { Loc.profileRoot.appendingPathComponent(".switcher", isDirectory: true) }
+    static var logURL: URL { home.appendingPathComponent("watchdog.log") }
+    static var stateURL: URL { home.appendingPathComponent("watchdog-state.json") }
+
+    /// "forced", "user" or "unknown", from the newest line that carries a marker.
+    static func exitKind(_ lines: [String]) -> String {
+        for line in lines.reversed() {
+            if userQuitMarkers.contains(where: { line.contains($0) }) { return "user" }
+            if forcedMarkers.contains(where: { line.contains($0) }) { return "forced" }
+        }
+        return "unknown"
+    }
+
+    /// The account's own log: inside its folder, and for the original account also where
+    /// Electron puts logs on macOS by default.
+    static func logTail(_ p: Profile, lines: Int = 40) -> [String] {
+        var candidates = [p.dataDir.appendingPathComponent("logs/main.log")]
+        if p.isDefault {
+            candidates.append(FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Claude/main.log"))
+        }
+        let existing = candidates.filter { FileManager.default.fileExists(atPath: $0.path) }
+        let newest = existing.max { a, b in
+            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return da < db
+        }
+        guard let url = newest, let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        return Array(text.components(separatedBy: .newlines).filter { !$0.isEmpty }.suffix(lines))
+    }
+
+    static func kept() -> Set<String> {
+        Set(Settings.map("KeepRunning").compactMap { ($0.value as? Bool) == true ? $0.key : nil })
+    }
+
+    static func select(_ profiles: [Profile], kept: Set<String>, kinds: [String: String], last: [String: Date], now: Date, cooldown: TimeInterval = 600) -> [Profile] {
+        profiles.filter { p in
+            kept.contains(p.id) && p.pid == nil && kinds[p.id] == "forced" &&
+                !(last[p.id].map { now.timeIntervalSince($0) < cooldown } ?? false)
+        }
+    }
+
+    static func write(_ message: String) {
+        try? FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        if let size = (try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size] as? Int), size > 100_000 {
+            try? FileManager.default.removeItem(at: logURL)
+        }
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        if let h = FileHandle(forWritingAtPath: logURL.path) { h.seekToEndOfFile(); h.write(Data(line.utf8)); h.closeFile() }
+        else { try? Data(line.utf8).write(to: logURL) }
+    }
+
+    static func loadState() -> [String: Date] {
+        guard let data = try? Data(contentsOf: stateURL), let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Double] else { return [:] }
+        return raw.mapValues { Date(timeIntervalSince1970: $0) }
+    }
+
+    static func saveState(_ state: [String: Date]) {
+        try? FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        if let data = try? JSONSerialization.data(withJSONObject: state.mapValues { $0.timeIntervalSince1970 }) { try? data.write(to: stateURL) }
+    }
+
+    /// Claude.app was replaced in the last minute: it is still settling, and brings back the
+    /// original account itself.
+    static func claudeUpdating() -> Bool {
+        guard let app = ClaudeApp.find(),
+              let date = try? app.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate else { return false }
+        return Date().timeIntervalSince(date) < 60
+    }
+
+    /// One pass. Returns the names reopened.
+    @discardableResult
+    static func runOnce() -> [String] {
+        let keep = kept()
+        if keep.isEmpty { return [] }
+        if claudeUpdating() { write("Claude is updating; waiting."); return [] }
+        let profiles = Profiles.list()
+        var kinds: [String: String] = [:]
+        for p in profiles where keep.contains(p.id) && p.pid == nil { kinds[p.id] = exitKind(logTail(p)) }
+        var state = loadState()
+        var done: [String] = []
+        for p in select(profiles, kept: keep, kinds: kinds, last: state, now: Date()) {
+            do {
+                try Launcher.start(p, background: true)
+                state[p.id] = Date()
+                saveState(state)
+                write("Reopened '\(p.name)': its log ended in a forced close.")
+                done.append(p.name)
+                Thread.sleep(forTimeInterval: 3)
+            } catch {
+                write("Could not reopen '\(p.name)': \(error.localizedDescription)")
+            }
+        }
+        return done
+    }
+
+    /// The agent exists exactly while some account is kept.
+    static func sync() throws {
+        if kept().isEmpty { Agents.remove(Agents.watchdogLabel) }
+        else { try Agents.install(Agents.watchdogLabel, arguments: ["--watch"], interval: 120, load: true) }
+    }
+}
+
+// MARK: - Claude Code chats
+
+struct Chat {
+    let file: URL
+    let account: String
+    let org: String
+    let title: String
+    let folder: String
+    let updated: Date
+    var id: String { String(file.deletingPathExtension().lastPathComponent.dropFirst("local_".count)) }
+}
+
+/*
+    The desktop app keeps one small JSON file per Claude Code chat, at
+        <profile>/claude-code-sessions/<account id>/<organisation id>/local_<id>.json
+    and the transcript itself outside the profile. Copying a chat to another account means
+    placing that file in the other profile's store, under the account it is signed in to.
+*/
+enum Chats {
+    static func root(_ p: Profile) -> URL { p.dataDir.appendingPathComponent("claude-code-sessions", isDirectory: true) }
+
+    static func subdirs(_ url: URL) -> [URL] {
+        ((try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey])) ?? [])
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+    }
+
+    static func first(_ obj: [String: Any]?, _ keys: [String]) -> String? {
+        for k in keys { if let v = obj?[k] as? String, !v.trimmingCharacters(in: .whitespaces).isEmpty { return v.trimmingCharacters(in: .whitespaces) } }
+        return nil
+    }
+
+    static func list(_ p: Profile) -> [Chat] {
+        var found: [String: Chat] = [:]
+        for account in subdirs(root(p)) {
+            for org in subdirs(account) {
+                let files = ((try? FileManager.default.contentsOfDirectory(at: org, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+                    .filter { $0.lastPathComponent.hasPrefix("local_") && $0.pathExtension == "json" }
+                for f in files {
+                    let obj = (try? Data(contentsOf: f)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+                    let folderPath = first(obj, ["cwd", "workingDirectory", "projectPath", "folder", "path"]) ?? ""
+                    let folder = folderPath.isEmpty ? "" : (folderPath.contains("/scratch-workspaces/") ? "(no folder)" : URL(fileURLWithPath: folderPath).lastPathComponent)
+                    let updated = (try? f.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                    let base = f.deletingPathExtension().lastPathComponent
+                    let title = first(obj, ["title", "name", "summary", "customTitle", "displayName"]) ?? "Chat \(base.dropFirst(6).prefix(8))"
+                    let chat = Chat(file: f, account: account.lastPathComponent, org: org.lastPathComponent, title: title, folder: folder, updated: updated)
+                    // The same chat can sit under two accounts after an earlier copy. List it once.
+                    if let seen = found[f.lastPathComponent], seen.updated >= updated { continue }
+                    found[f.lastPathComponent] = chat
+                }
+            }
+        }
+        return found.values.sorted { $0.updated > $1.updated }
+    }
+
+    /// The organisation folder written to most recently: whoever is signed in now.
+    static func store(_ p: Profile) -> URL? {
+        subdirs(root(p)).flatMap { subdirs($0) }.max { a, b in
+            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return da < db
+        }
+    }
+
+    /// True when copied, false when the target already has it. Only whole JSON string values
+    /// equal to the source account or organisation id are swapped for the target's, so paths
+    /// that merely contain the same ids are left alone.
+    @discardableResult
+    static func copy(_ c: Chat, to store: URL) throws -> Bool {
+        let dest = store.appendingPathComponent(c.file.lastPathComponent)
+        if FileManager.default.fileExists(atPath: dest.path) { return false }
+        var text = try String(contentsOf: c.file, encoding: .utf8)
+        let targetAccount = store.deletingLastPathComponent().lastPathComponent
+        text = text.replacingOccurrences(of: "\"\(c.account)\"", with: "\"\(targetAccount)\"")
+            .replacingOccurrences(of: "\"\(c.org)\"", with: "\"\(store.lastPathComponent)\"")
+        try text.write(to: dest, atomically: true, encoding: .utf8)
+        return true
+    }
+
+    static func noStoreMessage(_ p: Profile) -> String {
+        "'\(p.name)' has not used Claude Code yet, so there is nowhere to put the chats. Open it, sign in, visit the Code tab once, then try again."
+    }
+}
+
+// MARK: - Diagnostics and removal
+
+enum Maintenance {
+    static func redact(_ text: String) -> String {
+        let user = NSUserName()
+        return user.isEmpty ? text : text.replacingOccurrences(of: user, with: "<user>", options: .caseInsensitive)
+    }
+
+    static func doctor() -> String {
+        var out: [String] = []
+        out.append("Claude Profile Switcher \(switcherVersion) (macOS)")
+        out.append("macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        if let app = ClaudeApp.find() { out.append("Claude: \(ClaudeApp.version(of: app)) at \(app.path)") } else { out.append("Claude: NOT FOUND") }
+        out.append("Switcher: \(Agents.executable)")
+        out.append("Accounts folder: \(Loc.profileRoot.path)")
+        out.append("Watchdog agent: \(Agents.isInstalled(Agents.watchdogLabel) ? (Agents.isLoaded(Agents.watchdogLabel) ? "installed, loaded" : "installed, not loaded") : "not installed")")
+        out.append("Open at Login: \(Agents.isInstalled(Agents.loginLabel) ? "on" : "off")")
+        out.append("")
+        out.append("Accounts:")
+        let kept = Watchdog.kept()
+        for p in Profiles.list() {
+            var notes: [String] = []
+            if p.isDefault { notes.append("original") }
+            if kept.contains(p.id) { notes.append("kept running") }
+            let name = p.name == p.id ? p.name : "\(p.name) [\(p.id)]"
+            out.append("  \(name.padding(toLength: max(24, name.count + 1), withPad: " ", startingAt: 0))\(p.pid.map { "pid \($0)" } ?? "not open")  \(p.dataDir.path)\(notes.isEmpty ? "" : "  (\(notes.joined(separator: ", ")))")")
+        }
+        out.append("")
+        out.append("Watchdog log, last lines:")
+        let tail = (try? String(contentsOf: Watchdog.logURL, encoding: .utf8))?.components(separatedBy: .newlines).filter { !$0.isEmpty }.suffix(5) ?? []
+        out += tail.isEmpty ? ["  (none)"] : tail.map { "  \($0)" }
+        return redact(out.joined(separator: "\n"))
+    }
+
+    /// Everything the switcher made outside the accounts. Accounts and settings stay unless
+    /// removeProfiles asks for them to go. The app itself is dragged to the Bin by hand.
+    static func uninstall(removeProfiles: Bool) -> [String] {
+        var done: [String] = []
+        // Nothing is kept running after this, so deleting accounts below cannot bring the
+        // watchdog back.
+        if !Watchdog.kept().isEmpty { try? Settings.set("KeepRunning", nil); done.append("stopped keeping accounts running") }
+        for label in [Agents.watchdogLabel, Agents.loginLabel] where Agents.isInstalled(label) {
+            Agents.remove(label)
+            done.append("removed the launch agent \(label)")
+        }
+        if removeProfiles {
+            for p in Profiles.list() where !p.isDefault {
+                do { try Accounts.delete(p); done.append("deleted the account '\(p.name)' and its folder") }
+                catch { done.append("kept '\(p.name)': \(error.localizedDescription)") }
+            }
+        }
+        let home = Watchdog.home
+        if FileManager.default.fileExists(atPath: home.path) { try? FileManager.default.removeItem(at: home); done.append("removed \(home.path)") }
+        if removeProfiles {
+            if FileManager.default.fileExists(atPath: Loc.settingsFile.path) { try? FileManager.default.removeItem(at: Loc.settingsFile); done.append("removed \(Loc.settingsFile.path)") }
+            if ((try? FileManager.default.contentsOfDirectory(atPath: Loc.profileRoot.path)) ?? ["x"]).isEmpty {
+                try? FileManager.default.removeItem(at: Loc.profileRoot); done.append("removed \(Loc.profileRoot.path)")
+            }
+        } else {
+            done.append("kept your accounts and \(Loc.settingsFile.path); add --remove-profiles to delete them")
+        }
+        done.append("to finish, quit the switcher from the menu bar and drag it from Applications to the Bin")
+        return done
     }
 }
 
@@ -562,6 +928,7 @@ final class AccountsWindow: NSObject, NSWindowDelegate {
         name.font = .systemFont(ofSize: 14, weight: .medium)
         var detailText = p.pid != nil ? "Open" : "Not open"
         if p.isDefault { detailText += "  ·  your original" } else if p.name != p.id { detailText += "  ·  folder: \(p.id)" }
+        if AccountSettings.isKept(p.id) { detailText += "  ·  kept running" }
         let detail = NSTextField(labelWithString: detailText)
         detail.font = .systemFont(ofSize: 11)
         detail.textColor = p.pid != nil ? .systemGreen : .secondaryLabelColor
@@ -654,11 +1021,12 @@ final class AccountsWindow: NSObject, NSWindowDelegate {
     @objc func moreMenu(_ sender: NSButton) {
         guard let p = profile(from: sender) else { return }
         let m = NSMenu()
-        let rename = NSMenuItem(title: "Rename...", action: #selector(renameProfile(_:)), keyEquivalent: "")
+        let edit = NSMenuItem(title: "Edit...", action: #selector(editProfile(_:)), keyEquivalent: "")
         let restart = NSMenuItem(title: "Restart", action: #selector(restartProfile(_:)), keyEquivalent: "")
+        let transfer = NSMenuItem(title: "Transfer Code Chats...", action: #selector(transferChats(_:)), keyEquivalent: "")
         let finder = NSMenuItem(title: "Show in Finder", action: #selector(showInFinder(_:)), keyEquivalent: "")
         let delete = NSMenuItem(title: "Delete...", action: #selector(deleteProfile(_:)), keyEquivalent: "")
-        for item in [rename, restart, finder] { item.target = self; item.representedObject = p.id; m.addItem(item) }
+        for item in [edit, restart, transfer, finder] { item.target = self; item.representedObject = p.id; m.addItem(item) }
         m.addItem(.separator())
         delete.target = self
         delete.representedObject = p.id
@@ -667,23 +1035,171 @@ final class AccountsWindow: NSObject, NSWindowDelegate {
         m.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
     }
 
-    @objc func renameProfile(_ sender: NSMenuItem) {
-        guard let p = profile(from: sender) else { return }
+    /// The Edit dialog's fields, built apart so --snapshot-edit can render the same view.
+    final class EditForm {
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 318))
+        let name = NSTextField(frame: NSRect(x: 0, y: 274, width: 420, height: 24))
+        let colours = NSSegmentedControl()
+        let env = NSTextView(frame: NSRect(x: 0, y: 0, width: 404, height: 80))
+        let flags = NSTextField(frame: NSRect(x: 0, y: 64, width: 420, height: 24))
+        let keep = NSButton(checkboxWithTitle: "Keep running after Claude updates and restarts", target: nil, action: nil)
+
+        init(_ p: Profile) {
+            func label(_ text: String, _ y: CGFloat, small: Bool = false) {
+                let l = NSTextField(labelWithString: text)
+                l.frame = NSRect(x: 0, y: y, width: 420, height: 16)
+                l.font = small ? .systemFont(ofSize: 11) : .systemFont(ofSize: 12, weight: .medium)
+                if small { l.textColor = .secondaryLabelColor }
+                view.addSubview(l)
+            }
+            label("Name", 300)
+            name.stringValue = p.name
+            view.addSubview(name)
+            label("Badge colour", 252)
+            colours.segmentCount = Palette.rgb.count
+            colours.trackingMode = .selectOne
+            for i in 0..<Palette.rgb.count {
+                colours.setImage(Palette.badge(letter: "", fill: Palette.color(i), size: 14), forSegment: i)
+                colours.setWidth(44, forSegment: i)
+            }
+            colours.frame = NSRect(x: 0, y: 222, width: 420, height: 26)
+            colours.selectedSegment = p.isDefault ? -1 : Palette.index(for: p.id)
+            colours.isEnabled = !p.isDefault
+            view.addSubview(colours)
+            label("Environment variables, one per line as NAME=value", 200)
+            let scroll = NSScrollView(frame: NSRect(x: 0, y: 112, width: 420, height: 84))
+            scroll.hasVerticalScroller = true
+            scroll.borderType = .bezelBorder
+            env.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            env.isRichText = false
+            env.isAutomaticQuoteSubstitutionEnabled = false
+            env.string = AccountSettings.envText(p.id)
+            scroll.documentView = env
+            view.addSubview(scroll)
+            label("Extra launch flags", 92)
+            flags.stringValue = AccountSettings.argsText(p.id)
+            flags.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            view.addSubview(flags)
+            label("Variables and flags reach Claude the next time this account starts.", 44, small: true)
+            keep.frame = NSRect(x: 0, y: 14, width: 420, height: 22)
+            keep.state = AccountSettings.isKept(p.id) ? .on : .off
+            view.addSubview(keep)
+            label("Reopened when an update or restart closes it, not when you quit it.", -2, small: true)
+        }
+    }
+
+    func editAlert(_ p: Profile) -> (NSAlert, EditForm) {
         let a = NSAlert()
-        a.messageText = "Rename '\(p.name)'"
-        a.informativeText = "Only the name changes. Its sign-in and data stay as they are."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        field.stringValue = p.name
-        a.accessoryView = field
-        a.addButton(withTitle: "Rename")
+        a.messageText = "Edit '\(p.name)'"
+        a.informativeText = "Its sign-in and data stay as they are."
+        let form = EditForm(p)
+        a.accessoryView = form.view
+        a.addButton(withTitle: "Save")
         a.addButton(withTitle: "Cancel")
-        a.window.initialFirstResponder = field
+        a.window.initialFirstResponder = form.name
+        return (a, form)
+    }
+
+    @objc func editProfile(_ sender: NSMenuItem) {
+        guard let p = profile(from: sender) else { return }
+        let (a, form) = editAlert(p)
         guard a.runModal() == .alertFirstButtonReturn else { return }
+        // The name is the one field that can be refused, so it is checked before anything
+        // is saved: a refused edit changes nothing.
+        let newName = form.name.stringValue.trimmingCharacters(in: .whitespaces)
+        let renaming = !newName.isEmpty && newName != p.name
+        if renaming, let err = Profiles.validate(name: newName, except: p.id) {
+            showError(SwitcherError(err + " Nothing was saved."), title: "Could not save")
+            return
+        }
         do {
-            try Accounts.rename(p, to: field.stringValue)
+            let parsed = AccountSettings.parseEnv(form.env.string)
+            if !parsed.invalid.isEmpty {
+                let w = NSAlert()
+                w.messageText = "Some lines were left out"
+                w.informativeText = "These are not NAME=value with a name made of letters, digits and _ (not starting with a digit):\n\n" + parsed.invalid.joined(separator: "\n")
+                w.runModal()
+            }
+            let oldEnv = AccountSettings.envText(p.id)
+            let oldArgs = AccountSettings.argsText(p.id)
+            let newArgs = form.flags.stringValue.trimmingCharacters(in: .whitespaces)
+            try Settings.setEntry("ProfileEnv", id: p.id, value: parsed.vars.isEmpty ? nil : parsed.vars)
+            // Untouched flags keep their saved form: a list can hold quotes that the one-line
+            // text cannot carry back.
+            if newArgs != oldArgs { try Settings.setEntry("ProfileArgs", id: p.id, value: newArgs.isEmpty ? nil : newArgs) }
+            let launchChanged = AccountSettings.envText(p.id) != oldEnv || newArgs != oldArgs
+            if !p.isDefault, form.colours.selectedSegment >= 0, form.colours.selectedSegment != Palette.index(for: p.id) {
+                try Settings.setEntry("ChosenColors", id: p.id, value: form.colours.selectedSegment)
+            }
+            if (form.keep.state == .on) != AccountSettings.isKept(p.id) {
+                try Settings.setEntry("KeepRunning", id: p.id, value: form.keep.state == .on ? true : nil)
+                do { try Watchdog.sync() } catch { showError(error, title: "The choice is saved, but the watchdog could not be changed") }
+            }
+            if renaming { try Accounts.rename(p, to: newName) }
             refresh(force: true)
-            report("Renamed '\(p.name)' to '\(field.stringValue.trimmingCharacters(in: .whitespaces))'.")
-        } catch { showError(error, title: "Could not rename") }
+            report("Saved '\(renaming ? newName : p.name)'.")
+            if launchChanged, p.pid != nil {
+                let r = NSAlert()
+                r.messageText = "Restart '\(renaming ? newName : p.name)' to apply?"
+                r.informativeText = "It is open, and its new variables or flags apply when it starts again."
+                r.addButton(withTitle: "Restart")
+                r.addButton(withTitle: "Later")
+                if r.runModal() == .alertFirstButtonReturn { restartProfile(sender) }
+            }
+        } catch { showError(error, title: "Could not save") }
+    }
+
+    @objc func transferChats(_ sender: NSMenuItem) {
+        guard let source = profile(from: sender) else { return }
+        let chats = Chats.list(source)
+        let targets = Profiles.list(status: false).filter { $0.id != source.id }
+        if chats.isEmpty { report("'\(source.name)' has no Claude Code chats to transfer."); return }
+        if targets.isEmpty { report("Add a second account first, then transfer chats to it."); return }
+
+        let a = NSAlert()
+        a.messageText = "Copy Claude Code chats from '\(source.name)'"
+        a.informativeText = "Each chat stays here too. Finish a chat in one account before continuing it in the other, since both continue the same history."
+        let width: CGFloat = 440
+        let rowsHeight = CGFloat(chats.count) * 22
+        let list = FlippedView(frame: NSRect(x: 0, y: 0, width: width - 20, height: rowsHeight))
+        let df = DateFormatter()
+        df.dateStyle = .medium
+        df.timeStyle = .short
+        var boxes: [NSButton] = []
+        for (i, c) in chats.enumerated() {
+            let detail = [c.folder, df.string(from: c.updated)].filter { !$0.isEmpty }.joined(separator: "  ·  ")
+            let b = NSButton(checkboxWithTitle: "\(c.title)   \(detail)", target: nil, action: nil)
+            b.frame = NSRect(x: 0, y: CGFloat(i) * 22, width: width - 20, height: 20)
+            b.lineBreakMode = .byTruncatingTail
+            list.addSubview(b)
+            boxes.append(b)
+        }
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 34, width: width, height: min(220, rowsHeight + 6)))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.documentView = list
+        let to = NSPopUpButton(frame: NSRect(x: 60, y: 0, width: 220, height: 26))
+        to.addItems(withTitles: targets.map { $0.name })
+        let toLabel = NSTextField(labelWithString: "Copy to")
+        toLabel.frame = NSRect(x: 0, y: 4, width: 56, height: 18)
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: scroll.frame.maxY))
+        for v in [scroll, toLabel, to] as [NSView] { container.addSubview(v) }
+        a.accessoryView = container
+        a.addButton(withTitle: "Copy Chats")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let picked = zip(chats, boxes).filter { $0.1.state == .on }.map { $0.0 }
+        if picked.isEmpty { return }
+        let target = targets[to.indexOfSelectedItem]
+        guard let store = Chats.store(target) else { showError(SwitcherError(Chats.noStoreMessage(target)), title: "Not ready yet"); return }
+        do {
+            var copied = 0, skipped = 0
+            for c in picked { if try Chats.copy(c, to: store) { copied += 1 } else { skipped += 1 } }
+            var msg = "Copied \(copied) chat(s) to '\(target.name)'."
+            if skipped > 0 { msg += " \(skipped) were already there." }
+            if Profiles.resolve(target.id)?.pid != nil { msg += " Quit and reopen it to see them." }
+            report(msg)
+        } catch { showError(error, title: "Transfer failed") }
     }
 
     @objc func restartProfile(_ sender: NSMenuItem) {
@@ -800,6 +1316,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         show.target = self
         menu.addItem(show)
         menu.addItem(.separator())
+        let login = NSMenuItem(title: "Open at Login", action: #selector(menuLogin), keyEquivalent: "")
+        login.target = self
+        login.state = Agents.isInstalled(Agents.loginLabel) ? .on : .off
+        menu.addItem(login)
+        menu.addItem(.separator())
         let quitApp = NSMenuItem(title: "Quit Claude Profile Switcher", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quitApp)
     }
@@ -808,6 +1329,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func menuQuit(_ sender: NSMenuItem) { accounts.quitProfile(sender) }
     @objc func menuAdd() { accounts.addAccount() }
     @objc func menuShow() { accounts.show() }
+    @objc func menuLogin() {
+        if Agents.isInstalled(Agents.loginLabel) { Agents.remove(Agents.loginLabel) }
+        else { try? Agents.install(Agents.loginLabel, arguments: [], interval: nil, load: false) }
+    }
 }
 
 // MARK: - Command line
@@ -824,6 +1349,16 @@ With no arguments it runs as a menu bar app. From a terminal:
   --add-account               Make a new account and open Claude at its sign-in screen
   --rename NAME NEW-NAME      Rename (the folder and sign-in stay as they are)
   --delete NAME               Delete an account and its folder (signs it out here)
+  --chats NAME                That account's Claude Code chats
+  --transfer FROM TO [--all | --chat ID ...]
+                              Copy Claude Code chats to another account
+  --keep-running NAME         Reopen it when a Claude update, a logoff or a restart closes it
+  --stop-keeping NAME         Stop doing that
+  --watch                     One pass of that check (the launch agent runs it)
+  --open-at-login on|off      Start the switcher when you log in
+  --doctor                    What a bug report needs, user name redacted
+  --uninstall [--remove-profiles]
+                              Remove what the switcher made outside your accounts
   --claude-path PATH          Use this Claude.app (remembered)
   --version                   Print the version
 """
@@ -858,6 +1393,55 @@ func runCommandLine(_ args: [String]) throws -> Bool {
         if args.count == 2 { print("Using \(path)."); return true }
     }
     if args.contains("--list") { print(listText()); return true }
+    if args.contains("--doctor") { print(Maintenance.doctor()); return true }
+    if args.contains("--uninstall") {
+        for line in Maintenance.uninstall(removeProfiles: args.contains("--remove-profiles")) { print("- \(line)") }
+        return true
+    }
+    if args.contains("--watch") {
+        let reopened = Watchdog.runOnce()
+        if !reopened.isEmpty { print("Reopened: \(reopened.joined(separator: ", "))") }
+        return true
+    }
+    if let name = value(after: "--keep-running", in: args) {
+        let p = try Profiles.resolveOrThrow(name)
+        try Settings.setEntry("KeepRunning", id: p.id, value: true)
+        try Watchdog.sync()
+        print("'\(p.name)' is kept running: a Claude update, a logoff or a restart that closes it is undone within two minutes. Quitting it yourself leaves it closed.")
+        return true
+    }
+    if let name = value(after: "--stop-keeping", in: args) {
+        let p = try Profiles.resolveOrThrow(name)
+        try Settings.setEntry("KeepRunning", id: p.id, value: nil)
+        try Watchdog.sync()
+        print("'\(p.name)' is no longer kept running." + (Watchdog.kept().isEmpty ? " The watchdog agent was removed." : ""))
+        return true
+    }
+    if let mode = value(after: "--open-at-login", in: args) {
+        if mode == "on" { try Agents.install(Agents.loginLabel, arguments: [], interval: nil, load: false); print("The switcher opens when you log in.") }
+        else { Agents.remove(Agents.loginLabel); print("The switcher no longer opens at login.") }
+        return true
+    }
+    if let name = value(after: "--chats", in: args) {
+        let p = try Profiles.resolveOrThrow(name)
+        let df = ISO8601DateFormatter()
+        for c in Chats.list(p) { print("\(c.id)  \(df.string(from: c.updated))  \(c.folder.isEmpty ? "-" : c.folder)  \(c.title)") }
+        return true
+    }
+    if let i = args.firstIndex(of: "--transfer") {
+        guard i + 2 < args.count else { throw SwitcherError("Usage: --transfer FROM TO [--all | --chat ID ...]") }
+        let source = try Profiles.resolveOrThrow(args[i + 1])
+        let target = try Profiles.resolveOrThrow(args[i + 2])
+        if source.id == target.id { throw SwitcherError("Pick two different accounts.") }
+        let wanted = args.indices.filter { args[$0] == "--chat" && $0 + 1 < args.count }.map { args[$0 + 1] }
+        let chats = Chats.list(source).filter { args.contains("--all") || wanted.contains($0.id) || wanted.contains($0.file.lastPathComponent) }
+        if chats.isEmpty { throw SwitcherError("No chats picked. Use --all, or --chat with ids from --chats \"\(source.name)\".") }
+        guard let store = Chats.store(target) else { throw SwitcherError(Chats.noStoreMessage(target)) }
+        var copied = 0, skipped = 0
+        for c in chats { if try Chats.copy(c, to: store) { copied += 1 } else { skipped += 1 } }
+        print("Copied \(copied) chat(s) to '\(target.name)'." + (skipped > 0 ? " \(skipped) were already there." : ""))
+        return true
+    }
     if args.contains("--add-account") {
         let p = try Accounts.add()
         print("Added '\(p.name)'. Sign in with the other account in the Claude window that just opened.")
@@ -904,6 +1488,38 @@ func runCommandLine(_ args: [String]) throws -> Bool {
             guard let data = Palette.png(Palette.appIcon(size: CGFloat(px)), pixels: px) else { throw SwitcherError("Could not draw the icon.") }
             try data.write(to: url.appendingPathComponent("icon_\(name).png"))
         }
+        return true
+    }
+    if let path = value(after: "--snapshot-edit", in: args), let name = value(after: "--account", in: args) {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        if let mode = value(after: "--appearance", in: args) { app.appearance = NSAppearance(named: mode == "dark" ? .darkAqua : .aqua) }
+        let p = try Profiles.resolveOrThrow(name)
+        let w = AccountsWindow()
+        let (alert, _) = w.editAlert(p)
+        alert.layout()
+        alert.window.orderFrontRegardless()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.6))
+        guard let frame = alert.window.contentView,
+              let rep = frame.bitmapImageRepForCachingDisplay(in: frame.bounds) else { throw SwitcherError("Could not render the dialog.") }
+        frame.cacheDisplay(in: frame.bounds, to: rep)
+        // The dialog's own backdrop is a blur that a cached drawing leaves out, so lay the
+        // rendering over the window colour of the same appearance.
+        guard let out = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: rep.pixelsWide, pixelsHigh: rep.pixelsHigh, bitsPerSample: 8,
+                                         samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+        else { throw SwitcherError("Could not render the dialog.") }
+        out.size = rep.size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: out)
+        alert.window.effectiveAppearance.performAsCurrentDrawingAppearance {
+            NSColor.windowBackgroundColor.setFill()
+            NSRect(origin: .zero, size: rep.size).fill()
+        }
+        // A bitmap draws with .copy by default, which would wipe the backdrop.
+        rep.draw(in: NSRect(origin: .zero, size: rep.size), from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: false, hints: nil)
+        NSGraphicsContext.restoreGraphicsState()
+        guard let png = out.representation(using: .png, properties: [:]) else { throw SwitcherError("Could not render the dialog.") }
+        try png.write(to: URL(fileURLWithPath: path))
         return true
     }
     if let path = value(after: "--snapshot", in: args) {
