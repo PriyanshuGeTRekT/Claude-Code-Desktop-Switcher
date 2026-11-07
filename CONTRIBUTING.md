@@ -144,6 +144,20 @@ dialog. Copy the event args to a variable before the `switch`.
 **Keep the script ASCII only.** Without a BOM, Windows PowerShell 5.1 reads the file in
 the system codepage, so any non-ASCII character renders as garbage on other locales.
 
+## macOS
+
+The macOS app is `macos/ClaudeSwitcher.swift`, one file, AppKit only. On a Mac with the Xcode
+command line tools:
+
+    bash macos/build.sh                      # builds macos/build/Claude Profile Switcher.app
+    bash macos/tests/run-tests.sh "macos/build/Claude Profile Switcher.app/Contents/MacOS/ClaudeSwitcher"
+
+The tests build a stand-in `Claude.app` that records how it was started, and work in a
+temporary folder, so they never touch a real Claude or real accounts. CI runs the same on
+`macos-latest` for every change under `macos/`, and uploads the app and the window's
+screenshots as artifacts. Keep `switcherVersion` in the Swift file equal to
+`$script:SwitcherVersion` in `ClaudeSwitcher.ps1`.
+
 ## Releasing
 
 Bump `$script:SwitcherVersion` near the top of `ClaudeSwitcher.ps1` in the same change
