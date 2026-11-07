@@ -192,6 +192,7 @@ else
     echo "$out" | sed "s/^/      /"
     check "--route-sign-ins succeeds" '[ "$status" -eq 0 ]'
     check "the switcher is the claude:// handler" 'sw --status | grep -q "links open in: Claude Profile Switcher"'
+    check "a launch leaves a helper watching the handler" 'sw --launch Default >/dev/null; pgrep -f "ClaudeSwitcher --hold-handler" >/dev/null'
     sw --launch Default >/dev/null; wait_open Default open
     out="$(sw --add-account)"
     new="$(echo "$out" | sed -n "s/^Added '\([^']*\)'.*/\1/p")"

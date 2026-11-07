@@ -292,6 +292,7 @@ enum Launcher {
             try FileManager.default.createDirectory(at: profile.dataDir, withIntermediateDirectories: true)
             if !background, Router.isOn(), Router.signedIn(profile.dataDir) != true { Router.setPending(profile.id) }
         }
+        if Router.isOn() { Router.holdHandler() }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         p.arguments = openArguments(app: app, profile: profile, background: background)
@@ -977,6 +978,31 @@ enum Router {
         guard isOn(), !isOurs(), Bundle.main.bundleURL.pathExtension == "app" else { return }
         do { try setHandler(Bundle.main.bundleURL); log("Took back the claude:// handler.") }
         catch { log("Could not take back the claude:// handler: \(error.localizedDescription)") }
+    }
+
+    /// Claude makes itself the handler as it starts, and a sign-in can follow within
+    /// seconds, so after a launch the handler is watched closely for 20 s: on a background
+    /// thread in the menu bar app, or by a short-lived copy of the switcher otherwise.
+    static func holdHandler(seconds: Double = 20) {
+        if runningAsMenuBarApp {
+            DispatchQueue.global(qos: .utility).async { holdLoop(seconds) }
+            return
+        }
+        guard Bundle.main.bundleURL.pathExtension == "app", let exe = Bundle.main.executablePath else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = ["--hold-handler"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+    }
+
+    static func holdLoop(_ seconds: Double) {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end {
+            retake()
+            Thread.sleep(forTimeInterval: 0.5)
+        }
     }
 
     static func statusText() -> String {
@@ -1669,9 +1695,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Started to open a link, or at login: stay in the menu bar.
         let plainLaunch = (notification.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool) ?? true
         if plainLaunch && !startInBackground { accounts.show() }
-        // Every 20 s: take the claude:// handler back if Claude took it as it started, and
-        // once a day look for a newer switcher.
-        upkeep = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+        // Every 5 s: take the claude:// handler back if Claude took it as it started (a
+        // launch from here also watches closely for 20 s), and once a day look for a newer
+        // switcher.
+        upkeep = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             DispatchQueue.global(qos: .utility).async {
                 Router.retake()
                 guard Updater.isDue() else { return }
@@ -1896,6 +1923,7 @@ func runCommandLine(_ args: [String]) throws -> Bool {
     if args.contains("--list") { print(listText()); return true }
     if args.contains("--doctor") { print(Maintenance.doctor()); return true }
     if args == ["--in-background"] { startInBackground = true; return false }
+    if args == ["--hold-handler"] { Router.holdLoop(20); return true }
     if let link = value(after: "--handle-link", in: args) {
         // What the app does when macOS hands it a link; here for scripts and the tests.
         Router.handle(link)
@@ -2088,6 +2116,8 @@ func runCommandLine(_ args: [String]) throws -> Bool {
 
 /// Set by --in-background (the login agent): start in the menu bar without the window.
 var startInBackground = false
+/// True once the menu bar app runs, rather than a one-off command.
+var runningAsMenuBarApp = false
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 do {
@@ -2104,6 +2134,7 @@ if let id = Bundle.main.bundleIdentifier,
     exit(0)
 }
 
+runningAsMenuBarApp = true
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()
