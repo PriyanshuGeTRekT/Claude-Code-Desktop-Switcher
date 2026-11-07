@@ -52,6 +52,8 @@ enum Settings {
         try FileManager.default.createDirectory(at: Loc.profileRoot, withIntermediateDirectories: true)
         let data = try JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: Loc.settingsFile, options: .atomic)
+        // Owner only: ProfileEnv can hold tokens or proxy passwords.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Loc.settingsFile.path)
     }
 
     static func map(_ key: String) -> [String: Any] { load()[key] as? [String: Any] ?? [:] }

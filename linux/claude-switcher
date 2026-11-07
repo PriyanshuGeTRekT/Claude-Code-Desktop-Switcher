@@ -93,9 +93,13 @@ class Settings:
 
     @staticmethod
     def save(d):
-        PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
+        PROFILE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
         tmp = SETTINGS_FILE.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
+        # Owner only from the start: ProfileEnv can hold tokens or proxy passwords, and a
+        # home folder others can enter is common on shared machines.
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(d, f, indent=2, sort_keys=True)
         os.replace(tmp, SETTINGS_FILE)
 

@@ -83,6 +83,8 @@ check "Account 2 open again" 'wait_open "Account 2" open'
 last="$(grep -F "args=[--user-data-dir=$P/Account 2|" "$log" | tail -1)"
 check "restart passed the folder, then each flag as its own argument" 'echo "$last" | grep -qF "Account 2|--class=ClaudeProfile-account-2|--lang|a b]"'
 check "restart passed the environment variable" 'echo "$last" | grep -qF "MY_PEER=[peer-2]"'
+sw --edit "Account 2" --env TOKEN=secret >/dev/null
+check "settings.json, which can hold tokens, is readable by its owner only" '[ "$(stat -c %a "$P/settings.json")" = 600 ]'
 sw --edit "Account 2" --color 3 --flags="--x-one --x-two" --env EXTRA=1 >/dev/null
 setting() { "$py" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d.get(sys.argv[2],{}).get(sys.argv[3])))' "$P/settings.json" "$@"; }
 check "--edit saves the colour" '[ "$(setting ChosenColors "Account 2")" = 3 ]'
