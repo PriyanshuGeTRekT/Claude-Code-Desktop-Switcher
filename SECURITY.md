@@ -28,6 +28,10 @@ If you mark an account as kept running, the switcher creates one per-user schedu
 every two minutes and at logon. It reads each kept account's own `logs\main.log` to tell a
 forced close from a quit, and starts Claude; nothing else. `-RemoveWatchdog` deletes it.
 
+`-Uninstall` (or the tray's **Uninstall...**) removes all of that: shortcuts, the task, the
+`claude://` handler and the installed copy. Accounts and settings stay unless you add
+`-RemoveProfiles`.
+
 Profile directories contain live login sessions for whichever account signed in there.
 Treat them like any other browser profile. Anyone with read access to your user account
 can use them, and deleting a profile directory signs that account out on that machine.

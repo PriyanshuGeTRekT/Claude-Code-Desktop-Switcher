@@ -5,7 +5,7 @@ $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$null, [
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
 foreach ($name in @('Get-Setting','Test-SignInRoutingOn','Test-SafeLink','Test-SignInLink','Get-ProfileDataPath','Test-ProfileSignedIn',
                     'Set-PendingSignIn','Get-PendingSignIn','Clear-PendingSignIn','Select-SignInTarget','Get-LauncherScript',
-                    'Get-RouterCommand','Get-RegistryDefault','Set-RegistryValue','Get-RouterRegistryPath','Test-RouterRegistered',
+                    'Get-RouterCommand','Get-LauncherCommand','Get-ShortcutStyle','Get-RegistryDefault','Set-RegistryValue','Get-RouterRegistryPath','Test-RouterRegistered',
                     'Register-SignInRouter','Test-RouterChosen','Unregister-SignInRouter','Set-Setting','Write-RouterLog',
                     'Disable-SignInRouting','Test-HandleLinkAlone')) {
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}, $true)

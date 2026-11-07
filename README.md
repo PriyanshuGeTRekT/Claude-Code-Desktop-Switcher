@@ -209,6 +209,9 @@ same two limits apply: a copy that is already open keeps the flags it started wi
 | `.\ClaudeSwitcher.ps1 -KeepRunning Work` | Reopen that account after a Claude update, a logoff or a restart closes it |
 | `.\ClaudeSwitcher.ps1 -StopKeeping Work` | Stop doing that |
 | `.\ClaudeSwitcher.ps1 -InstallWatchdog` / `-RemoveWatchdog` | Create or delete the scheduled task behind it |
+| `.\ClaudeSwitcher.ps1 -ShortcutStyle hidden` | Remake shortcuts in a plainer shape (`headless`, `hidden` or `plain`) for antivirus products that delete the default one |
+| `.\ClaudeSwitcher.ps1 -Doctor` | Print what a bug report needs, user name redacted |
+| `.\ClaudeSwitcher.ps1 -Uninstall` | Remove shortcuts, the task, sign-in routing and the installed copy; add `-RemoveProfiles` to delete accounts too |
 | `.\ClaudeSwitcher.ps1 -List` | Print profiles and which are running |
 | `.\ClaudeSwitcher.ps1 -Shortcut Work` | Desktop and Start menu shortcuts for one profile |
 | `.\ClaudeSwitcher.ps1 -Shortcut Work -To <dir>` | A shortcut in a folder of your choice |
@@ -338,11 +341,42 @@ generated shortcuts already handle this.
 </details>
 
 <details>
+<summary><b>My antivirus deletes the shortcuts</b></summary>
+
+The shortcuts run `conhost --headless powershell -ExecutionPolicy Bypass -File ...`, which
+is also what a lot of malware looks like, so some products (Huorong has been reported)
+delete them as a trojan pattern. Pick a plainer shape and the shortcuts, the `claude://`
+handler and the watchdog task are made again:
+
+```powershell
+.\ClaudeSwitcher.ps1 -ShortcutStyle hidden    # no conhost; a console may flicker
+.\ClaudeSwitcher.ps1 -ShortcutStyle plain     # also without -ExecutionPolicy Bypass
+```
+
+`plain` needs an execution policy that runs the installed copy: `Set-ExecutionPolicy
+-Scope CurrentUser RemoteSigned` once (`-Install` already unblocks the file).
+`-ShortcutStyle headless` goes back to the default.
+</details>
+
+<details>
+<summary><b>Removing the switcher</b></summary>
+
+Right-click the tray icon and choose **Uninstall...**, or run `.\ClaudeSwitcher.ps1
+-Uninstall`. That removes the shortcuts, the watchdog task, sign-in routing and the
+installed copy, and says what it did. Your accounts stay signed in, in their folders, and
+`settings.json` is kept so a reinstall finds your names and colours; `-Uninstall
+-RemoveProfiles` deletes those too.
+</details>
+
+<details>
 <summary><b>A shortcut does nothing</b></summary>
 
 Anything fatal is shown in a message box and written to
 `%LOCALAPPDATA%\ClaudeProfiles\switcher-error.log`. If you deleted or renamed a profile
 outside the switcher, its old shortcut will report that the profile no longer exists.
+For a bug report, run `.\ClaudeSwitcher.ps1 -Doctor` (or use the tray's **Copy
+diagnostics**) and paste the output: it has the versions, the accounts and the last lines
+of every log, with your Windows user name replaced.
 </details>
 
 <details>

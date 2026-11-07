@@ -71,6 +71,8 @@ Run the isolated regression tests with Windows PowerShell 5.1 and PowerShell 7:
     pwsh -NoProfile -File .\tests\Update.Tests.ps1
     powershell -NoProfile -File .\tests\Watchdog.Tests.ps1
     pwsh -NoProfile -File .\tests\Watchdog.Tests.ps1
+    powershell -NoProfile -File .\tests\Launcher.Tests.ps1
+    pwsh -NoProfile -File .\tests\Launcher.Tests.ps1
 
 These tests use temporary session stores and shortcuts, and never launch Claude or read
 real chats. The sign-in routing tests write only under a throwaway
@@ -158,9 +160,9 @@ person will otherwise remove it.
 
 ## Reporting bugs
 
-Open an issue with your Windows version, whether your Claude desktop is the Store build or
-an installer build, and the contents of `%LOCALAPPDATA%\ClaudeProfiles\switcher-error.log`
-if there is anything in it.
+Open an issue and paste the output of `.\ClaudeSwitcher.ps1 -Doctor` (or the tray's
+**Copy diagnostics**): versions, which Claude build, each account's state, and the last
+lines of every log, with your Windows user name already replaced.
 
 The switcher's own files (installed copy, icons) live in
 `%LOCALAPPDATA%\ClaudeProfiles\.switcher`, and settings, labels and colours in

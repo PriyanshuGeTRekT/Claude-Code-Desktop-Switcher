@@ -3,7 +3,7 @@ $source = Join-Path (Split-Path $PSScriptRoot -Parent) 'ClaudeSwitcher.ps1'
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$null, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in @('Get-ClaudeExitKind', 'Select-WatchdogTargets', 'Get-WatchdogCommand', 'Get-LauncherScript', 'Get-KeptProfiles', 'Get-ProfileMap')) {
+foreach ($name in @('Get-ClaudeExitKind', 'Select-WatchdogTargets', 'Get-WatchdogCommand', 'Get-LauncherCommand', 'Get-ShortcutStyle', 'Get-LauncherScript', 'Get-KeptProfiles', 'Get-ProfileMap')) {
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}, $true)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
