@@ -43,37 +43,28 @@ so they all stay signed in and run at the same time, Claude Code included.
 
 ## Install
 
-<table>
-<tr><th>Windows 10 or 11</th><th>macOS 12 or later</th></tr>
-<tr valign="top">
-<td>
+### Windows 10 or 11
 
-Download **[Install-ClaudeProfileSwitcher.cmd](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/releases/latest/download/Install-ClaudeProfileSwitcher.cmd)** and double-click it.
-
-Or in PowerShell:
+Download **[Install-ClaudeProfileSwitcher.cmd](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/releases/latest/download/Install-ClaudeProfileSwitcher.cmd)**
+and double-click it. It adds **Claude Profile Switcher** to the desktop and Start menu and
+opens it. Or in PowerShell:
 
 ```powershell
 irm https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/releases/latest/download/ClaudeSwitcher.ps1 -OutFile "$env:TEMP\ClaudeSwitcher.ps1"; powershell -ExecutionPolicy Bypass -File "$env:TEMP\ClaudeSwitcher.ps1" -Install
 ```
 
-It adds **Claude Profile Switcher** to the desktop and Start menu and opens it.
+### macOS 12 or later
 
-</td>
-<td>
-
-Download **[ClaudeProfileSwitcher-macOS.zip](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/releases/latest/download/ClaudeProfileSwitcher-macOS.zip)**, unzip it, and drag **Claude Profile Switcher** to Applications.
-
-The first time, **right-click it and choose Open**: it is not notarized by Apple, so a plain double-click is refused once. Or in Terminal:
+Download **[ClaudeProfileSwitcher-macOS.zip](https://github.com/PriyanshuGeTRekT/Claude-Code-Desktop-Switcher/releases/latest/download/ClaudeProfileSwitcher-macOS.zip)**,
+unzip it, and drag **Claude Profile Switcher** to Applications. The first time, **right-click
+it and choose Open**: it is not notarized by Apple, so a plain double-click is refused once.
+Or clear that flag in Terminal:
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/Claude Profile Switcher.app"
 ```
 
 It lives in the menu bar.
-
-</td>
-</tr>
-</table>
 
 ## Add your second account in three steps
 
