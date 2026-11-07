@@ -1,0 +1,59 @@
+name: Linux
+
+on:
+  push:
+    branches: [main]
+    paths: ['linux/**', '.github/workflows/linux.yml']
+  pull_request:
+    paths: ['linux/**', '.github/workflows/linux.yml']
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Test, package and screenshot
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install GTK for Python, Xvfb and desktop-file-utils
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq python3-gi python3-gi-cairo gir1.2-gtk-3.0 xvfb dbus desktop-file-utils fonts-dejavu-core libglib2.0-bin
+
+      - name: Lint
+        run: |
+          /usr/bin/python3 -m py_compile linux/claude-switcher
+          pipx run pyflakes linux/claude-switcher
+          shellcheck linux/install.sh linux/build.sh
+
+      - name: End-to-end tests against a stand-in Claude
+        run: bash linux/tests/run-tests.sh "$RUNNER_TEMP/shots"
+
+      - name: Build the downloads
+        run: bash linux/build.sh "$RUNNER_TEMP/dist"
+
+      - name: The .deb installs and runs
+        run: |
+          sudo apt-get install -yq "$RUNNER_TEMP"/dist/claude-profile-switcher_*_all.deb
+          claude-switcher --version
+          desktop-file-validate /usr/share/applications/claude-profile-switcher.desktop
+
+      - name: The tarball installs and runs
+        run: |
+          mkdir -p "$RUNNER_TEMP/tar" && tar -C "$RUNNER_TEMP/tar" -xzf "$RUNNER_TEMP/dist/ClaudeProfileSwitcher-linux.tar.gz"
+          HOME="$RUNNER_TEMP/home" XDG_DATA_HOME="$RUNNER_TEMP/home/.local/share" sh "$RUNNER_TEMP/tar/ClaudeProfileSwitcher-linux/install.sh"
+          "$RUNNER_TEMP/home/.local/bin/claude-switcher" --version
+
+      - name: Upload the downloads
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeProfileSwitcher-linux
+          path: ${{ runner.temp }}/dist
+
+      - name: Upload the screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-screenshots
+          path: ${{ runner.temp }}/shots

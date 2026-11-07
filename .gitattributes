@@ -15,3 +15,5 @@ LICENSE text eol=lf
 *.sh    text eol=lf
 *.swift text eol=lf
 *.plist text eol=lf
+*.c text eol=lf
+linux/claude-switcher text eol=lf

@@ -1,0 +1,2023 @@
+#!/usr/bin/env python3
+"""Claude Profile Switcher for Linux.
+
+Runs several Claude desktop accounts side by side, each in a data folder of its own
+(Electron's --user-data-dir), as the Windows and macOS switchers do. Works with Anthropic's
+claude-desktop package and with the community claude-desktop-unofficial build.
+
+Run it with no arguments for the window (GTK 3), or see --help for the command line.
+Unofficial; not affiliated with Anthropic. MIT License.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "2.4.0"
+DEFAULT_ID = "Default"
+APP_ID = "io.github.priyanshugetrekt.ClaudeProfileSwitcher"
+REPO = "PriyanshuGeTRekT/Claude-Code-Desktop-Switcher"
+SCHEME = "claude"
+
+
+class SwitcherError(Exception):
+    pass
+
+
+# ----------------------------------------------------------------- where things live --
+
+def _env_path(name, fallback):
+    v = os.environ.get(name, "")
+    return Path(v) if v else fallback
+
+
+HOME = Path.home()
+CONFIG_HOME = _env_path("XDG_CONFIG_HOME", HOME / ".config")
+DATA_HOME = _env_path("XDG_DATA_HOME", HOME / ".local" / "share")
+# Where Claude keeps its own data, and where the extra accounts go beside it.
+SUPPORT = _env_path("CLAUDE_SWITCHER_SUPPORT_DIR", CONFIG_HOME)
+PROFILE_ROOT = SUPPORT / "ClaudeProfiles"
+SETTINGS_FILE = PROFILE_ROOT / "settings.json"
+DEFAULT_DATA = SUPPORT / "Claude"
+STATE_DIR = PROFILE_ROOT / ".switcher"
+APPS_DIR = DATA_HOME / "applications"
+ICONS_DIR = DATA_HOME / "icons" / "hicolor" / "scalable" / "apps"
+MAIN_DESKTOP = APPS_DIR / "claude-profile-switcher.desktop"
+ROUTER_DESKTOP = APPS_DIR / "claude-profile-router.desktop"
+MIMEAPPS = CONFIG_HOME / "mimeapps.list"
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def append_line(path, message):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > 100_000:
+            path.unlink()
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (now_iso(), message))
+    except OSError:
+        pass
+
+
+def switcher_command():
+    """How .desktop files and helpers start this program again."""
+    return os.path.realpath(sys.argv[0])
+
+
+# ------------------------------------------------- settings.json (same keys everywhere) --
+
+class Settings:
+    @staticmethod
+    def load():
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def save(d):
+        PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
+        tmp = SETTINGS_FILE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2, sort_keys=True)
+        os.replace(tmp, SETTINGS_FILE)
+
+    @staticmethod
+    def get(key, default=None):
+        return Settings.load().get(key, default)
+
+    @staticmethod
+    def map(key):
+        v = Settings.load().get(key)
+        return v if isinstance(v, dict) else {}
+
+    @staticmethod
+    def set(key, value):
+        d = Settings.load()
+        if value is None:
+            d.pop(key, None)
+        else:
+            d[key] = value
+        Settings.save(d)
+
+    @staticmethod
+    def set_entry(key, pid, value):
+        d = Settings.load()
+        m = d.get(key) if isinstance(d.get(key), dict) else {}
+        if value is None:
+            m.pop(pid, None)
+        else:
+            m[pid] = value
+        d[key] = m
+        Settings.save(d)
+
+
+# ----------------------------------------------------------------------- finding Claude --
+
+COMMANDS = ["claude-desktop", "claude-desktop-unofficial"]
+KNOWN_PATHS = [
+    "/usr/bin/claude-desktop", "/usr/local/bin/claude-desktop", "/opt/Claude/claude-desktop",
+    "/usr/lib/claude-desktop/claude-desktop", "/opt/claude-desktop/claude-desktop",
+    "/usr/bin/claude-desktop-unofficial", "/usr/lib/claude-desktop-unofficial/claude-desktop",
+]
+# Names the main Claude process can carry. Never "claude": that is Claude Code's CLI.
+PROCESS_NAMES = {"claude-desktop", "claude-desktop-unofficial", "Claude", "claude-desktop-bin"}
+
+
+def find_claude():
+    override = os.environ.get("CLAUDE_SWITCHER_APP", "")
+    if override:
+        return override if os.access(override, os.X_OK) else None
+    saved = Settings.get("ClaudePath")
+    if isinstance(saved, str) and os.access(saved, os.X_OK):
+        return saved
+    for c in COMMANDS:
+        found = shutil.which(c)
+        if found:
+            return found
+    for p in KNOWN_PATHS:
+        if os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def require_claude():
+    app = find_claude()
+    if not app:
+        raise SwitcherError(
+            "Claude for Linux was not found. Install Anthropic's claude-desktop package "
+            "(https://claude.com/download), or point the switcher at it with --claude-path PATH.")
+    return app
+
+
+def claude_version(app):
+    for cmd in (["dpkg-query", "-W", "-f=${Version}", "claude-desktop"],
+                ["dpkg-query", "-W", "-f=${Version}", "claude-desktop-unofficial"],
+                ["rpm", "-q", "--qf", "%{VERSION}", "claude-desktop"]):
+        if shutil.which(cmd[0]):
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                if out.returncode == 0 and out.stdout.strip():
+                    return out.stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return "unknown version"
+
+
+# ----------------------------------------------------------------------------- profiles --
+
+class Profile:
+    def __init__(self, pid_, name, data_dir, pid=None):
+        self.id = pid_
+        self.name = name
+        self.data_dir = Path(data_dir)
+        self.pid = pid
+
+    @property
+    def is_default(self):
+        return self.id == DEFAULT_ID
+
+    @property
+    def wm_class(self):
+        """Its own window class, so the taskbar keeps each account apart and pins it to
+        its own launcher. The original account keeps Claude's own."""
+        return None if self.is_default else "ClaudeProfile-" + slug(self.id)
+
+
+def slug(text):
+    s = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-").lower()
+    return s or "account"
+
+
+def profile_dir(pid_):
+    return DEFAULT_DATA if pid_ == DEFAULT_ID else PROFILE_ROOT / pid_
+
+
+def profile_ids():
+    ids = [DEFAULT_ID]
+    try:
+        dirs = [p.name for p in PROFILE_ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    except OSError:
+        dirs = []
+    natural = lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+    return ids + sorted(dirs, key=natural)
+
+
+def list_profiles(status=True):
+    labels = {k: v for k, v in Settings.map("Labels").items() if isinstance(v, str)}
+    ids = profile_ids()
+    running = running_map(ids) if status else {}
+    return [Profile(i, labels.get(i, i), profile_dir(i), running.get(i)) for i in ids]
+
+
+def resolve(name, status=True):
+    allp = list_profiles(status)
+    for test in (lambda p: p.id == name, lambda p: p.name == name, lambda p: p.name.lower() == name.lower()):
+        for p in allp:
+            if test(p):
+                return p
+    return None
+
+
+def resolve_or_throw(name):
+    p = resolve(name)
+    if p:
+        return p
+    known = ", ".join(p.name for p in list_profiles(False))
+    raise SwitcherError("There is no Claude profile called '%s'. Profiles: %s" % (name, known))
+
+
+def validate_name(raw, except_id):
+    name = raw.strip()
+    if not name:
+        return "Name cannot be empty."
+    if len(name) > 40:
+        return "Name is too long (40 characters max)."
+    if name.startswith(".") or "/" in name or ":" in name or "\0" in name:
+        return "Name cannot start with a dot or contain / or :."
+    for p in list_profiles(False):
+        if p.id != except_id and (p.id == name or p.name == name):
+            return "A profile named '%s' already exists." % name
+    if except_id is None and (PROFILE_ROOT / name).exists():
+        return "'%s' is already taken in %s." % (name, PROFILE_ROOT)
+    return None
+
+
+def next_account_name():
+    n = 2
+    while validate_name("Account %d" % n, None):
+        n += 1
+    return "Account %d" % n
+
+
+# -------------------------------------------------------------------- running accounts --
+
+def _processes():
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % d, "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0")]
+        if argv and argv[-1] == "":
+            argv.pop()
+        if argv:
+            yield int(d), argv
+
+
+def _norm(path):
+    return os.path.normpath(os.path.realpath(path))
+
+
+def running_map(ids):
+    """Account id to the process id of its main Claude process. Electron's helpers carry
+    --type=... and the same --user-data-dir, so they are skipped; so is anything whose
+    program name is not Claude's when it runs without a folder (the original account)."""
+    by_dir = {_norm(str(profile_dir(i))): i for i in ids if i != DEFAULT_ID}
+    app = find_claude()
+    names = set(PROCESS_NAMES)
+    if app:
+        names.add(os.path.basename(app))
+        names.add(os.path.basename(os.path.realpath(app)))
+    me = {os.getpid(), os.getppid()}
+    found = {}
+    for pid, argv in _processes():
+        if pid in me or any(a.startswith("--type=") for a in argv):
+            continue
+        dirs = [a[len("--user-data-dir="):] for a in argv if a.startswith("--user-data-dir=")]
+        if dirs:
+            hit = by_dir.get(_norm(dirs[-1]))
+            if not hit and _norm(dirs[-1]) == _norm(str(DEFAULT_DATA)):
+                hit = DEFAULT_ID
+        else:
+            exe = os.path.basename(argv[0])
+            try:
+                real = os.path.basename(os.readlink("/proc/%d/exe" % pid))
+            except OSError:
+                real = ""
+            hit = DEFAULT_ID if (exe in names or real in names) and "crashpad" not in exe else None
+        if hit and (hit not in found or pid < found[hit]):
+            found[hit] = pid
+    return found
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().split(") ")[-1][:1] != "Z"
+    except OSError:
+        return False
+
+
+# ------------------------------------------------------------------------------ launcher --
+
+def split_args(s):
+    out, cur, quote, anything = [], "", None, False
+    for ch in s:
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                cur += ch
+        elif ch in "\"'":
+            quote, anything = ch, True
+        elif ch in " \t\r\n":
+            if anything or cur:
+                out.append(cur)
+                cur, anything = "", False
+        else:
+            cur += ch
+            anything = True
+    if anything or cur:
+        out.append(cur)
+    return out
+
+
+def extra_args(pid_):
+    v = Settings.map("ProfileArgs").get(pid_)
+    if isinstance(v, list):
+        return [str(a) for a in v]
+    if isinstance(v, str):
+        return split_args(v)
+    return []
+
+
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def profile_env(pid_):
+    m = Settings.map("ProfileEnv").get(pid_)
+    if not isinstance(m, dict):
+        return {}
+    return {k: str(v) for k, v in m.items() if ENV_NAME.match(k)}
+
+
+def launch_command(app, profile, trailing=()):
+    cmd = [app]
+    if not profile.is_default:
+        cmd += ["--user-data-dir=%s" % profile.data_dir, "--class=%s" % profile.wm_class]
+    return cmd + extra_args(profile.id) + list(trailing)
+
+
+def spawn(cmd, env_extra=None):
+    env = dict(os.environ)
+    env.update(env_extra or {})
+    # Our test and override variables are for the switcher, not for Claude.
+    for k in ("CLAUDE_SWITCHER_APP", "CLAUDE_SWITCHER_SUPPORT_DIR", "CLAUDE_SWITCHER_RELEASE_DIR", "CLAUDE_SWITCHER_NO_FOCUS"):
+        if k not in (env_extra or {}):
+            env.pop(k, None)
+    return subprocess.Popen(cmd, env=env, cwd=str(HOME), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def focus(profile):
+    """Brings an open account forward: by its window class when wmctrl is installed,
+    otherwise by starting it again, which Electron's single-instance lock turns into
+    focusing the copy already using that folder."""
+    if profile.wm_class and shutil.which("wmctrl") and not os.environ.get("CLAUDE_SWITCHER_NO_FOCUS"):
+        if subprocess.run(["wmctrl", "-x", "-a", profile.wm_class], capture_output=True).returncode == 0:
+            return
+    app = require_claude()
+    spawn(launch_command(app, profile), profile_env(profile.id))
+
+
+def start(profile):
+    """Returns "focused" when the account was already open, "started" otherwise."""
+    if profile.pid:
+        focus(profile)
+        return "focused"
+    app = require_claude()
+    if not profile.is_default:
+        profile.data_dir.mkdir(parents=True, exist_ok=True)
+        if Router.is_on() and Router.signed_in(profile.data_dir) is not True:
+            Router.set_pending(profile.id)
+    spawn(launch_command(app, profile), profile_env(profile.id))
+    if Router.is_on():
+        Router.hold_handler()
+    return "started"
+
+
+def wait_gone(pid, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.2)
+    return not pid_alive(pid)
+
+
+def stop(profile, grace=8):
+    if not profile.pid:
+        return False
+    pid = profile.pid
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    if wait_gone(pid, grace):
+        return True
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    if wait_gone(pid, 4):
+        return True
+    raise SwitcherError("Could not quit '%s' (process %d)." % (profile.name, pid))
+
+
+def restart(profile):
+    if profile.pid:
+        stop(profile)
+        time.sleep(0.5)
+        profile = resolve(profile.id) or profile
+    start(profile)
+
+
+# ------------------------------------------------------------------------------ accounts --
+
+def add_account():
+    name = next_account_name()
+    d = PROFILE_ROOT / name
+    d.mkdir(parents=True, exist_ok=True)
+    p = Profile(name, name, d)
+    start(p)
+    Launchers.refresh()
+    return p
+
+
+def rename_account(p, raw):
+    name = raw.strip()
+    err = validate_name(name, p.id)
+    if err:
+        raise SwitcherError(err)
+    Settings.set_entry("Labels", p.id, None if name == p.id else name)
+    Launchers.refresh()
+
+
+def delete_account(p):
+    if p.is_default:
+        raise SwitcherError("The Default profile is your original Claude and cannot be deleted here.")
+    d = Path(os.path.normpath(str(p.data_dir)))
+    # Never anything but a direct child of our own folder.
+    if d.parent != Path(os.path.normpath(str(PROFILE_ROOT))) or p.id.startswith(".") or "/" in p.id:
+        raise SwitcherError("Refusing to delete %s." % d)
+    if p.pid:
+        stop(p)
+    if d.exists():
+        shutil.rmtree(d)
+    for key in ("Labels", "Colors", "ChosenColors", "ProfileArgs", "ProfileEnv"):
+        Settings.set_entry(key, p.id, None)
+    Launchers.remove_one(p.id)
+
+
+# --------------------------------------------------------------------------------- colours --
+
+PALETTE = [(66, 133, 180), (76, 150, 96), (150, 96, 180), (190, 80, 110),
+           (60, 150, 150), (90, 110, 200), (200, 150, 50), (80, 86, 100)]
+
+
+def colour_index(pid_):
+    chosen = Settings.map("ChosenColors").get(pid_)
+    if isinstance(chosen, int):
+        return chosen % len(PALETTE)
+    assigned = {k: v for k, v in Settings.map("Colors").items() if isinstance(v, int)}
+    if pid_ in assigned:
+        return assigned[pid_] % len(PALETTE)
+    alive = set(profile_ids())
+    use = [0] * len(PALETTE)
+    for k, v in assigned.items():
+        if k in alive:
+            use[v % len(PALETTE)] += 1
+    pick = use.index(min(use))
+    assigned[pid_] = pick
+    Settings.set("Colors", assigned)
+    return pick
+
+
+def hex_colour(i):
+    return "#%02x%02x%02x" % PALETTE[i % len(PALETTE)]
+
+
+def letter(name):
+    for c in name:
+        if c.isalnum():
+            return c.upper()
+    return name[:1].upper()
+
+
+def badge_svg(fill, text):
+    esc = text.replace("&", "&amp;").replace("<", "&lt;")
+    return ('<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">'
+            '<circle cx="128" cy="128" r="118" fill="%s"/>'
+            '<text x="128" y="128" dy=".35em" text-anchor="middle" font-family="sans-serif" '
+            'font-weight="bold" font-size="132" fill="#ffffff">%s</text></svg>\n' % (fill, esc))
+
+
+APP_ICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">'
+                '<rect x="12" y="12" width="232" height="232" rx="52" fill="#2b2d33"/>'
+                '<circle cx="104" cy="112" r="58" fill="#4285b4"/>'
+                '<circle cx="152" cy="146" r="58" fill="#4c9660" stroke="#2b2d33" stroke-width="8"/></svg>\n')
+
+
+# ------------------------------------------------------------------ app menu launchers --
+
+def desktop_quote(arg):
+    if re.match(r"^[A-Za-z0-9_./=:+-]+$", arg):
+        return arg
+    return '"' + re.sub(r'(["`$\\])', r"\\\1", arg) + '"'
+
+
+def desktop_exec(args):
+    # A literal % must be doubled in Exec.
+    return " ".join(desktop_quote(a) for a in args).replace("%", "%%")
+
+
+class Launchers:
+    """Each account in the app menu with its own coloured icon, and the switcher's own
+    entry listing them as quick actions (right-click it in the dock)."""
+
+    @staticmethod
+    def installed():
+        return MAIN_DESKTOP.exists()
+
+    @staticmethod
+    def account_file(pid_):
+        return APPS_DIR / ("claude-profile-%s.desktop" % slug(pid_))
+
+    @staticmethod
+    def icon_name(pid_):
+        return "claude-profile-" + slug(pid_)
+
+    @staticmethod
+    def write_all():
+        APPS_DIR.mkdir(parents=True, exist_ok=True)
+        ICONS_DIR.mkdir(parents=True, exist_ok=True)
+        (ICONS_DIR / "claude-profile-switcher.svg").write_text(APP_ICON_SVG, encoding="utf-8")
+        me = switcher_command()
+        profiles = list_profiles(False)
+        actions = []
+        for p in profiles:
+            if not p.is_default:
+                (ICONS_DIR / (Launchers.icon_name(p.id) + ".svg")).write_text(
+                    badge_svg(hex_colour(colour_index(p.id)), letter(p.name)), encoding="utf-8")
+                Launchers.account_file(p.id).write_text("\n".join([
+                    "[Desktop Entry]", "Type=Application",
+                    "Name=Claude (%s)" % p.name,
+                    "Comment=Claude, signed in as your %s account" % p.name,
+                    "Exec=%s" % desktop_exec([me, "--launch", p.id]),
+                    "Icon=%s" % Launchers.icon_name(p.id),
+                    "StartupWMClass=%s" % p.wm_class,
+                    "Categories=Utility;", "Terminal=false",
+                    "X-Claude-Profile-Switcher=%s" % VERSION, ""]), encoding="utf-8")
+            actions.append(p)
+        lines = ["[Desktop Entry]", "Type=Application", "Name=Claude Profile Switcher",
+                 "GenericName=Claude account switcher",
+                 "Comment=Run several Claude desktop accounts at once",
+                 "Exec=%s" % desktop_exec([me]), "Icon=claude-profile-switcher",
+                 "Categories=Utility;", "Keywords=Claude;Anthropic;account;profile;switch;",
+                 "Terminal=false", "StartupNotify=true",
+                 "Actions=%s" % "".join("open-%s;" % slug(p.id) for p in actions) + "add-account;", ""]
+        for p in actions:
+            lines += ["[Desktop Action open-%s]" % slug(p.id), "Name=Open %s" % p.name,
+                      "Exec=%s" % desktop_exec([me, "--launch", p.id]), ""]
+        lines += ["[Desktop Action add-account]", "Name=Add Account", "Exec=%s" % desktop_exec([me, "--add-account"]), ""]
+        MAIN_DESKTOP.write_text("\n".join(lines), encoding="utf-8")
+        # Files of accounts that are gone.
+        keep = {Launchers.account_file(p.id).name for p in profiles if not p.is_default}
+        for f in APPS_DIR.glob("claude-profile-*.desktop"):
+            if f.name not in keep and f.name not in (MAIN_DESKTOP.name, ROUTER_DESKTOP.name):
+                f.unlink()
+        Launchers.update_caches()
+
+    @staticmethod
+    def update_caches():
+        if shutil.which("update-desktop-database"):
+            subprocess.run(["update-desktop-database", str(APPS_DIR)], capture_output=True)
+
+    @staticmethod
+    def refresh():
+        if Launchers.installed():
+            try:
+                Launchers.write_all()
+            except OSError:
+                pass
+
+    @staticmethod
+    def remove_one(pid_):
+        for f in (Launchers.account_file(pid_), ICONS_DIR / (Launchers.icon_name(pid_) + ".svg")):
+            if f.exists():
+                f.unlink()
+        Launchers.refresh()
+
+    @staticmethod
+    def remove_all():
+        removed = 0
+        for f in list(APPS_DIR.glob("claude-profile-*.desktop")) + list(ICONS_DIR.glob("claude-profile-*.svg")):
+            if f.name != ROUTER_DESKTOP.name:
+                f.unlink()
+                removed += 1
+        Launchers.update_caches()
+        return removed
+
+
+# -------------------------------------------------------------------------- Code chats --
+
+class Chat:
+    def __init__(self, file, account, org, title, folder, updated):
+        self.file, self.account, self.org = file, account, org
+        self.title, self.folder, self.updated = title, folder, updated
+
+    @property
+    def id(self):
+        return self.file.stem[len("local_"):]
+
+
+class Chats:
+    """The desktop app keeps one small JSON file per Claude Code chat, at
+    <profile>/claude-code-sessions/<account id>/<organisation id>/local_<id>.json.
+    Copying a chat means placing that file in another profile's store."""
+
+    @staticmethod
+    def _subdirs(p):
+        try:
+            return [d for d in p.iterdir() if d.is_dir()]
+        except OSError:
+            return []
+
+    @staticmethod
+    def root(profile):
+        return profile.data_dir / "claude-code-sessions"
+
+    @staticmethod
+    def _first(obj, keys):
+        for k in keys:
+            v = obj.get(k) if isinstance(obj, dict) else None
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return None
+
+    @staticmethod
+    def list(profile):
+        found = {}
+        for account in Chats._subdirs(Chats.root(profile)):
+            for org in Chats._subdirs(account):
+                for f in org.glob("local_*.json"):
+                    try:
+                        obj = json.loads(f.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        obj = {}
+                    folder_path = Chats._first(obj, ["cwd", "workingDirectory", "projectPath", "folder", "path"]) or ""
+                    folder = "" if not folder_path else ("(no folder)" if "/scratch-workspaces/" in folder_path else os.path.basename(folder_path.rstrip("/")))
+                    updated = f.stat().st_mtime
+                    title = Chats._first(obj, ["title", "name", "summary", "customTitle", "displayName"]) or "Chat %s" % f.stem[6:14]
+                    seen = found.get(f.name)
+                    if seen and seen.updated >= updated:
+                        continue
+                    found[f.name] = Chat(f, account.name, org.name, title, folder, updated)
+        return sorted(found.values(), key=lambda c: -c.updated)
+
+    @staticmethod
+    def store(profile):
+        orgs = [o for a in Chats._subdirs(Chats.root(profile)) for o in Chats._subdirs(a)]
+        return max(orgs, key=lambda o: o.stat().st_mtime) if orgs else None
+
+    @staticmethod
+    def copy(chat, store):
+        """True when copied, False when the target already has it. Only whole JSON string
+        values equal to the source account or organisation id are swapped."""
+        dest = store / chat.file.name
+        if dest.exists():
+            return False
+        text = chat.file.read_text(encoding="utf-8")
+        text = text.replace('"%s"' % chat.account, '"%s"' % store.parent.name).replace('"%s"' % chat.org, '"%s"' % store.name)
+        dest.write_text(text, encoding="utf-8")
+        return True
+
+    @staticmethod
+    def no_store_message(p):
+        return ("'%s' has not used Claude Code yet, so there is nowhere to put the chats. Open it, sign in, "
+                "visit the Code tab once, then try again." % p.name)
+
+
+# ---------------------------------------------------------------------- sign-in links --
+
+class Router:
+    """A browser finishes a sign-in by opening a claude:// link, and the desktop gives it
+    to whichever copy of Claude it starts, usually the original account. With routing on,
+    the switcher is the claude:// handler instead and sends the link to the account that
+    is waiting for it: started while signed out, else the only open account that is signed
+    out, else the one whose window was used last, else Default. The link reaches that
+    account by starting its Claude with the link, which Electron's single-instance lock
+    hands to the copy already using that folder. Links are never written to a log."""
+
+    PENDING = STATE_DIR / "pending-sign-in.json"
+    BACKUP = STATE_DIR / "claude-handler-backup.txt"
+    LOG = STATE_DIR / "router.log"
+    SAFE = re.compile(r"^claude://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*\Z")
+    SIGN_IN = re.compile(r"^claude://(login/|claude\.ai/sso-callback([/?#]|\Z))")
+    MIME = "x-scheme-handler/claude"
+
+    @staticmethod
+    def is_on():
+        return Settings.get("SignInRouting") is True
+
+    @staticmethod
+    def log(msg):
+        append_line(Router.LOG, msg)
+
+    @staticmethod
+    def is_safe(link):
+        return isinstance(link, str) and len(link) <= 2048 and bool(Router.SAFE.match(link))
+
+    @staticmethod
+    def is_sign_in(link):
+        return bool(Router.SIGN_IN.match(link))
+
+    @staticmethod
+    def signed_in(data_dir):
+        try:
+            obj = json.loads((Path(data_dir) / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(obj, dict):
+            return None
+        if "windowSizeWasSignedIn" in obj:
+            return obj["windowSizeWasSignedIn"] is True
+        if "oauth:tokenCacheV2" in obj:
+            return len(str(obj["oauth:tokenCacheV2"])) > 100
+        return False
+
+    @staticmethod
+    def set_pending(pid_, minutes=15):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        Router.PENDING.write_text(json.dumps({"Profile": pid_, "Expires": time.time() + minutes * 60}), encoding="utf-8")
+
+    @staticmethod
+    def clear_pending():
+        try:
+            Router.PENDING.unlink()
+        except OSError:
+            pass
+
+    @staticmethod
+    def pending():
+        if not Router.PENDING.exists():
+            return None
+        try:
+            d = json.loads(Router.PENDING.read_text(encoding="utf-8"))
+            if d["Expires"] > time.time():
+                return str(d["Profile"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        Router.clear_pending()
+        return None
+
+    @staticmethod
+    def select(profiles, signed, pending, front):
+        if pending:
+            for p in profiles:
+                if p.id == pending and not p.is_default:
+                    return p, "launched while signed out"
+        open_ = [p for p in profiles if p.pid and not p.is_default]
+        out = [p for p in open_ if signed.get(p.id) is False]
+        if len(out) == 1:
+            return out[0], "the only open account that is signed out"
+        if front:
+            for p in open_:
+                if p.pid == front:
+                    return p, "its window was used most recently"
+        return None
+
+    @staticmethod
+    def frontmost(pids):
+        """On X11, the topmost window owned by one of these processes (xprop needed). The
+        browser is in front during a sign-in, so the stacking order is used, not focus."""
+        if not pids or not shutil.which("xprop") or not os.environ.get("DISPLAY"):
+            return None
+        try:
+            out = subprocess.run(["xprop", "-root", "_NET_CLIENT_LIST_STACKING"], capture_output=True, text=True, timeout=3).stdout
+            for wid in reversed(re.findall(r"0x[0-9a-fA-F]+", out)):
+                o = subprocess.run(["xprop", "-id", wid, "_NET_WM_PID"], capture_output=True, text=True, timeout=3).stdout
+                m = re.search(r"= (\d+)", o)
+                if m and int(m.group(1)) in pids:
+                    return int(m.group(1))
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return None
+
+    @staticmethod
+    def other_link_target():
+        pid_ = Settings.get("OpenLinksIn")
+        if not isinstance(pid_, str) or pid_ == DEFAULT_ID:
+            return None
+        p = resolve(pid_)
+        return None if (p is None or p.is_default) else p
+
+    @staticmethod
+    def deliver(link, target):
+        app = require_claude()
+        if not target.is_default:
+            target.data_dir.mkdir(parents=True, exist_ok=True)
+        spawn(launch_command(app, target, [link]), profile_env(target.id))
+        return "handed to its Claude" if target.pid else "started it with the link"
+
+    @staticmethod
+    def handle(link):
+        if not Router.is_safe(link):
+            Router.log("Refused a claude:// link that failed validation.")
+            return
+
+        def to_default(note):
+            try:
+                how = Router.deliver(link, resolve(DEFAULT_ID))
+                Router.log("%s (%s)" % (note, how))
+            except Exception as e:  # losing the link would be worse than any error
+                Router.log("Could not pass a link to Default: %s" % e)
+
+        if not Router.is_on():
+            to_default("Routing is off; passed a link to Default.")
+            return
+        try:
+            if not Router.is_sign_in(link):
+                other = Router.other_link_target()
+                if not other:
+                    to_default("Not a sign-in link; passed to Default.")
+                    return
+                try:
+                    how = Router.deliver(link, other)
+                    Router.log("Not a sign-in link; opened in '%s' (Open Other Links In, %s)." % (other.name, how))
+                except Exception as e:
+                    to_default("Could not open a link in '%s': %s. Passed to Default." % (other.name, e))
+                return
+            profiles = list_profiles()
+            signed = {}
+            for p in profiles:
+                if p.pid and not p.is_default:
+                    v = Router.signed_in(p.data_dir)
+                    if v is not None:
+                        signed[p.id] = v
+            pick = Router.select(profiles, signed, Router.pending(), Router.frontmost([p.pid for p in profiles if p.pid]))
+            if not pick:
+                to_default("Sign-in sent to Default (no other account was waiting for one).")
+            else:
+                target, reason = pick
+                try:
+                    how = Router.deliver(link, target)
+                    Router.log("Sign-in sent to '%s' (%s, %s)." % (target.name, reason, how))
+                except Exception as e:
+                    to_default("Routing failed: %s. Sign-in passed to Default." % e)
+            Router.clear_pending()
+        finally:
+            Router.hold_handler()
+
+    # The handler itself, in mimeapps.list.
+    @staticmethod
+    def _read_mimeapps():
+        try:
+            return MIMEAPPS.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+
+    @staticmethod
+    def handler():
+        section = None
+        for line in Router._read_mimeapps():
+            s = line.strip()
+            if s.startswith("[") and s.endswith("]"):
+                section = s
+            elif section == "[Default Applications]" and s.startswith(Router.MIME + "="):
+                return s.split("=", 1)[1].split(";")[0].strip() or None
+        if shutil.which("xdg-mime"):
+            try:
+                out = subprocess.run(["xdg-mime", "query", "default", Router.MIME], capture_output=True, text=True, timeout=5).stdout.strip()
+                return out or None
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return None
+
+    @staticmethod
+    def set_handler(desktop_name):
+        """Writes the choice into the user's mimeapps.list (what xdg-mime does), keeping
+        every other line as it was. None removes the entry."""
+        lines = Router._read_mimeapps()
+        out, section, done, saw_section = [], None, False, False
+        for line in lines:
+            s = line.strip()
+            if s.startswith("[") and s.endswith("]"):
+                if section == "[Default Applications]" and not done and desktop_name:
+                    out.append("%s=%s" % (Router.MIME, desktop_name))
+                    done = True
+                section = s
+                saw_section = saw_section or s == "[Default Applications]"
+                out.append(line)
+                continue
+            if section == "[Default Applications]" and s.startswith(Router.MIME + "="):
+                if desktop_name and not done:
+                    out.append("%s=%s" % (Router.MIME, desktop_name))
+                    done = True
+                continue
+            out.append(line)
+        if desktop_name and not done:
+            if section == "[Default Applications]":
+                out.append("%s=%s" % (Router.MIME, desktop_name))
+            else:
+                if out and out[-1].strip():
+                    out.append("")
+                out += ["[Default Applications]", "%s=%s" % (Router.MIME, desktop_name)]
+        MIMEAPPS.parent.mkdir(parents=True, exist_ok=True)
+        MIMEAPPS.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def is_ours():
+        return Router.handler() == ROUTER_DESKTOP.name
+
+    @staticmethod
+    def write_router_desktop():
+        APPS_DIR.mkdir(parents=True, exist_ok=True)
+        ROUTER_DESKTOP.write_text("\n".join([
+            "[Desktop Entry]", "Type=Application", "Name=Claude Profile Router",
+            "Comment=Sends each Claude sign-in to the account that asked for it",
+            "Exec=%s --handle-link %%u" % desktop_exec([switcher_command()]),
+            "MimeType=%s;" % Router.MIME, "NoDisplay=true", "Terminal=false", ""]), encoding="utf-8")
+        Launchers.update_caches()
+
+    @staticmethod
+    def enable():
+        previous = Router.handler()
+        if previous and previous != ROUTER_DESKTOP.name:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            Router.BACKUP.write_text(previous, encoding="utf-8")
+        Router.write_router_desktop()
+        Settings.set("SignInRouting", True)
+        Router.set_handler(ROUTER_DESKTOP.name)
+
+    @staticmethod
+    def disable():
+        Settings.set("SignInRouting", None)
+        Router.clear_pending()
+        if Router.is_ours():
+            try:
+                previous = Router.BACKUP.read_text(encoding="utf-8").strip()
+            except OSError:
+                previous = ""
+            Router.set_handler(previous or None)
+        for f in (ROUTER_DESKTOP, Router.BACKUP):
+            if f.exists():
+                f.unlink()
+        Launchers.update_caches()
+
+    @staticmethod
+    def retake():
+        """Claude makes itself the handler again as it starts; take it back."""
+        if Router.is_on() and not Router.is_ours():
+            current = Router.handler()
+            if current and current != ROUTER_DESKTOP.name:
+                STATE_DIR.mkdir(parents=True, exist_ok=True)
+                Router.BACKUP.write_text(current, encoding="utf-8")
+            if not ROUTER_DESKTOP.exists():
+                Router.write_router_desktop()
+            Router.set_handler(ROUTER_DESKTOP.name)
+            Router.log("Took back the claude:// handler.")
+
+    @staticmethod
+    def hold_handler(seconds=20):
+        """After a launch, watch the handler closely for a while: in a thread when the
+        window is running, otherwise in a short-lived copy of the switcher."""
+        if not Router.is_on():
+            return
+        if RUNNING_GUI:
+            threading.Thread(target=Router.hold_loop, args=(seconds,), daemon=True).start()
+            return
+        try:
+            subprocess.Popen([sys.executable, switcher_command(), "--hold-handler"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            pass
+
+    @staticmethod
+    def hold_loop(seconds=20):
+        end = time.time() + seconds
+        while time.time() < end:
+            try:
+                Router.retake()
+            except OSError:
+                pass
+            time.sleep(0.5)
+
+    @staticmethod
+    def status_text():
+        other = Router.other_link_target()
+        lines = ["Sign-in routing:  %s" % ("on" if Router.is_on() else "off"),
+                 "claude:// links open in: %s" % (Router.handler() or "nothing set"),
+                 "Other links:      open in '%s'" % (other.name if other else DEFAULT_ID)]
+        pend = Router.pending()
+        if pend:
+            p = resolve(pend, status=False)
+            if p:
+                lines.append("Waiting for:      '%s' to sign in" % p.name)
+        return "\n".join(lines)
+
+
+RUNNING_GUI = False
+
+
+# ---------------------------------------------------------------------------- updates --
+
+class Updater:
+    """Releases publish claude-switcher next to SHA256SUMS.txt. An update installs it
+    only when it matches the published checksum, compiles, and is newer, and only over a
+    copy the user can write (a .deb install is updated with the new .deb instead)."""
+
+    ASSET = "claude-switcher"
+    LOG = STATE_DIR / "update.log"
+
+    @staticmethod
+    def feed():
+        d = os.environ.get("CLAUDE_SWITCHER_RELEASE_DIR", "")
+        return Path(d) if d else None
+
+    @staticmethod
+    def compare(a, b):
+        def parts(v):
+            head = re.match(r"[0-9.]*", v).group(0)
+            return [int(x) if x.isdigit() else 0 for x in head.split(".") if x != ""]
+        pa, pb = parts(a), parts(b)
+        for i in range(max(len(pa), len(pb))):
+            x = pa[i] if i < len(pa) else 0
+            y = pb[i] if i < len(pb) else 0
+            if x != y:
+                return -1 if x < y else 1
+        return 0
+
+    @staticmethod
+    def _open(url, method="GET", timeout=60):
+        req = urllib.request.Request(url, method=method, headers={"User-Agent": "ClaudeProfileSwitcher/%s (Linux)" % VERSION})
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    @staticmethod
+    def latest_version():
+        f = Updater.feed()
+        if f:
+            return (f / "latest-version").read_text(encoding="utf-8").strip()
+        with Updater._open("https://github.com/%s/releases/latest" % REPO, "HEAD", 30) as r:
+            final = r.geturl()
+        m = re.search(r"/releases/tag/v([^/?#]+)$", final)
+        if not m:
+            raise SwitcherError("Could not tell the latest version from %s." % final)
+        return m.group(1)
+
+    @staticmethod
+    def download(name):
+        f = Updater.feed()
+        if f:
+            return (f / name).read_bytes()
+        with Updater._open("https://github.com/%s/releases/latest/download/%s" % (REPO, name), timeout=120) as r:
+            return r.read()
+
+    @staticmethod
+    def published_hash(sums, name):
+        for line in sums.splitlines():
+            m = re.match(r"^\s*([0-9a-fA-F]{64})\s+\*?(.+?)\s*$", line)
+            if m and m.group(2) == name:
+                return m.group(1).lower()
+        return None
+
+    @staticmethod
+    def check():
+        try:
+            Settings.set("LastUpdateCheck", now_iso())
+        except OSError:
+            pass
+        v = Updater.latest_version()
+        return v if Updater.compare(v, VERSION) > 0 else None
+
+    @staticmethod
+    def is_due():
+        if Settings.get("UpdateCheck") is False:
+            return False
+        last = Settings.get("LastUpdateCheck")
+        try:
+            t = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - t).total_seconds() > 24 * 3600
+        except (TypeError, ValueError):
+            return True
+
+    @staticmethod
+    def install():
+        target = switcher_command()
+        if not os.access(target, os.W_OK) or not os.access(os.path.dirname(target), os.W_OK):
+            raise SwitcherError("%s belongs to the system (a .deb install). Install the new "
+                                "claude-profile-switcher .deb from https://github.com/%s/releases/latest instead." % (target, REPO))
+        if not Updater.check():
+            return None
+        sums = Updater.download("SHA256SUMS.txt").decode("utf-8", "replace")
+        expected = Updater.published_hash(sums, Updater.ASSET)
+        if not expected:
+            raise SwitcherError("The release has no checksum for %s, so nothing was changed." % Updater.ASSET)
+        data = Updater.download(Updater.ASSET)
+        if hashlib.sha256(data).hexdigest() != expected:
+            raise SwitcherError("The download does not match the published checksum, so nothing was changed.")
+        m = re.search(rb'^VERSION = "([^"]+)"', data, re.M)
+        if not m:
+            raise SwitcherError("The download is not the switcher, so nothing was changed.")
+        new_version = m.group(1).decode()
+        if Updater.compare(new_version, VERSION) <= 0:
+            raise SwitcherError("The download is version %s, not newer than %s. Nothing was changed." % (new_version, VERSION))
+        try:
+            compile(data, Updater.ASSET, "exec")
+        except SyntaxError as e:
+            raise SwitcherError("The download does not compile (%s), so nothing was changed." % e)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".claude-switcher-")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, target)
+        append_line(Updater.LOG, "Updated from %s to %s." % (VERSION, new_version))
+        return new_version
+
+
+# ---------------------------------------------------------------- diagnostics, removal --
+
+def redact(text):
+    user = os.environ.get("USER") or Path.home().name
+    if not user:
+        return text
+    return re.sub(re.escape(user), "<user>", text, flags=re.I)
+
+
+def doctor():
+    app = find_claude()
+    out = ["Claude Profile Switcher %s (Linux)" % VERSION]
+    try:
+        with open("/etc/os-release") as f:
+            pretty = re.search(r'^PRETTY_NAME="?([^"\n]+)', f.read(), re.M)
+        out.append(pretty.group(1) if pretty else "Linux")
+    except OSError:
+        out.append("Linux")
+    out.append("Session: %s, desktop %s" % (os.environ.get("XDG_SESSION_TYPE", "unknown"), os.environ.get("XDG_CURRENT_DESKTOP", "unknown")))
+    out.append("Claude: %s at %s" % (claude_version(app), app) if app else "Claude: NOT FOUND")
+    out.append("Switcher: %s" % switcher_command())
+    out.append("Accounts folder: %s" % PROFILE_ROOT)
+    out.append("App menu launchers: %s" % ("installed" if Launchers.installed() else "not installed"))
+    out.append(Router.status_text())
+    out.append("Update check: %s" % ("off" if Settings.get("UpdateCheck") is False else "daily"))
+    out.append("Window: %s" % ("GTK 3 available" if gtk_available() else "GTK 3 for Python missing (python3-gi)"))
+    out.append("")
+    out.append("Accounts:")
+    for p in list_profiles():
+        name = p.name if p.name == p.id else "%s [%s]" % (p.name, p.id)
+        notes = ["original"] if p.is_default else []
+        signed = None if p.is_default else Router.signed_in(p.data_dir)
+        if signed is not None:
+            notes.append("signed in" if signed else "signed out")
+        out.append("  %-24s %-10s %s%s" % (name, "pid %d" % p.pid if p.pid else "not open", p.data_dir,
+                                         "  (%s)" % ", ".join(notes) if notes else ""))
+    out.append("")
+    out.append("Router log, last lines:")
+    try:
+        tail = Router.LOG.read_text(encoding="utf-8").splitlines()[-5:]
+    except OSError:
+        tail = []
+    out += ["  " + t for t in tail] or ["  (none)"]
+    return redact("\n".join(out))
+
+
+def uninstall(remove_profiles):
+    done = []
+    if Router.is_on() or Router.is_ours():
+        Router.disable()
+        done.append("gave claude:// links back to %s" % (Router.handler() or "the system default"))
+    n = Launchers.remove_all()
+    if n:
+        done.append("removed %d app menu launcher file(s)" % n)
+    if remove_profiles:
+        for p in list_profiles():
+            if not p.is_default:
+                try:
+                    delete_account(p)
+                    done.append("deleted the account '%s' and its folder" % p.name)
+                except Exception as e:
+                    done.append("kept '%s': %s" % (p.name, e))
+    if STATE_DIR.exists():
+        shutil.rmtree(STATE_DIR, ignore_errors=True)
+        done.append("removed %s" % STATE_DIR)
+    if remove_profiles:
+        if SETTINGS_FILE.exists():
+            SETTINGS_FILE.unlink()
+            done.append("removed %s" % SETTINGS_FILE)
+        try:
+            PROFILE_ROOT.rmdir()
+            done.append("removed %s" % PROFILE_ROOT)
+        except OSError:
+            pass
+    else:
+        done.append("kept your accounts and %s; add --remove-profiles to delete them" % SETTINGS_FILE)
+    me = switcher_command()
+    if me.startswith("/usr/"):
+        done.append("to finish, remove the package: sudo apt remove claude-profile-switcher")
+    else:
+        done.append("to finish, delete %s" % me)
+    return done
+
+
+def list_text():
+    rows = []
+    for p in list_profiles():
+        name = p.name if p.name == p.id else "%s [%s]" % (p.name, p.id)
+        state = "open (pid %d)" % p.pid if p.pid else "not open"
+        rows.append("%-24s%-22s%s" % (name + " ", state, p.data_dir))
+    return "\n".join(rows)
+
+
+# --------------------------------------------------------------------------------- window --
+
+def gtk_available():
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def run_gui(snapshot=None, appearance=None, snapshot_edit=None):
+    global RUNNING_GUI
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk, Gdk, GLib, Gio, Pango
+    except Exception:
+        print("The window needs GTK 3 for Python. On Ubuntu or Debian: sudo apt install python3-gi gir1.2-gtk-3.0\n"
+              "Everything also works from the command line; see claude-switcher --help.", file=sys.stderr)
+        return 1
+    import cairo  # comes with python3-gi-cairo, which GTK's Python bindings pull in
+
+    RUNNING_GUI = True
+    if appearance:
+        Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", appearance == "dark")
+
+    def badge(fill_index, text, size):
+        area = Gtk.DrawingArea()
+        area.set_size_request(size, size)
+        area.set_valign(Gtk.Align.CENTER)
+
+        def draw(_w, cr):
+            r, g, b = PALETTE[fill_index % len(PALETTE)]
+            cr.set_source_rgb(r / 255, g / 255, b / 255)
+            cr.arc(size / 2, size / 2, size / 2, 0, 6.2832)
+            cr.fill()
+            if text:
+                cr.set_source_rgb(1, 1, 1)
+                cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                cr.set_font_size(size * 0.5)
+                ext = cr.text_extents(text)
+                cr.move_to(size / 2 - ext.width / 2 - ext.x_bearing, size / 2 - ext.height / 2 - ext.y_bearing)
+                cr.show_text(text)
+        area.connect("draw", draw)
+        return area
+
+    def message(parent, title, text, buttons=(("Close", Gtk.ResponseType.CLOSE),), kind=Gtk.MessageType.INFO):
+        d = Gtk.MessageDialog(transient_for=parent, modal=True, message_type=kind, buttons=Gtk.ButtonsType.NONE, text=title)
+        if text:
+            d.format_secondary_text(text)
+        for label, resp in buttons:
+            d.add_button(label, resp)
+        r = d.run()
+        d.destroy()
+        return r
+
+    def in_background(work, done=None):
+        def run():
+            try:
+                result, err = work(), None
+            except Exception as e:  # shown to the user, not raised
+                result, err = None, e
+            if done:
+                GLib.idle_add(lambda: (done(result, err), False)[1])
+        threading.Thread(target=run, daemon=True).start()
+
+    class EditDialog(Gtk.Dialog):
+        def __init__(self, parent, p):
+            Gtk.Dialog.__init__(self, title="Edit '%s'" % p.name, transient_for=parent, modal=True)
+            self.set_default_size(460, -1)
+            self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            save = self.add_button("Save", Gtk.ResponseType.OK)
+            save.get_style_context().add_class("suggested-action")
+            self.set_default_response(Gtk.ResponseType.OK)
+            box = self.get_content_area()
+            box.set_spacing(6)
+            box.set_border_width(14)
+
+            def label(text, small=False):
+                l = Gtk.Label(label=text, xalign=0)
+                l.set_line_wrap(True)
+                if small:
+                    l.get_style_context().add_class("dim-label")
+                    l.set_markup("<small>%s</small>" % GLib.markup_escape_text(text))
+                else:
+                    l.set_markup("<b>%s</b>" % GLib.markup_escape_text(text))
+                box.pack_start(l, False, False, 0)
+
+            label("Name")
+            self.name = Gtk.Entry(text=p.name, activates_default=True)
+            box.pack_start(self.name, False, False, 0)
+            label("Badge colour")
+            row = Gtk.Box(spacing=6)
+            self.colours = []
+            current = -1 if p.is_default else colour_index(p.id)
+            first = None
+            for i in range(len(PALETTE)):
+                b = Gtk.RadioButton.new_from_widget(first)
+                first = first or b
+                b.set_mode(False)
+                b.add(badge(i, "", 18))
+                b.set_active(i == current)
+                b.set_sensitive(not p.is_default)
+                self.colours.append(b)
+                row.pack_start(b, False, False, 0)
+            box.pack_start(row, False, False, 0)
+            label("Environment variables, one per line as NAME=value")
+            self.env = Gtk.TextView(monospace=True)
+            self.env.get_buffer().set_text("\n".join("%s=%s" % kv for kv in sorted(profile_env(p.id).items())))
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_min_content_height(80)
+            scroll.set_shadow_type(Gtk.ShadowType.IN)
+            scroll.add(self.env)
+            box.pack_start(scroll, True, True, 0)
+            label("Extra launch flags")
+            raw = Settings.map("ProfileArgs").get(p.id)
+            self.flags_text = raw if isinstance(raw, str) else " ".join(
+                '"%s"' % a if " " in a else a for a in (raw or []) if isinstance(a, str))
+            self.flags = Gtk.Entry(text=self.flags_text)
+            box.pack_start(self.flags, False, False, 0)
+            label("Variables and flags reach Claude the next time this account starts.", small=True)
+            self.show_all()
+
+        def picked_colour(self):
+            for i, b in enumerate(self.colours):
+                if b.get_active():
+                    return i
+            return -1
+
+        def env_text(self):
+            buf = self.env.get_buffer()
+            return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+
+    class Window(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            Gtk.ApplicationWindow.__init__(self, application=app, title="Claude Profile Switcher")
+            self.set_default_size(620, 420)
+            self.set_icon_name("claude-profile-switcher")
+            self.signature = None
+            self.available_update = None
+
+            header = Gtk.HeaderBar(show_close_button=True, title="Claude Profile Switcher")
+            self.set_titlebar(header)
+            self.header = header
+            add = Gtk.Button(label="Add Account")
+            add.get_style_context().add_class("suggested-action")
+            add.connect("clicked", lambda _b: self.add_account())
+            header.pack_start(add)
+            menu_button = Gtk.MenuButton()
+            menu_button.add(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON))
+            self.app_menu = Gtk.Menu()
+            menu_button.set_popup(self.app_menu)
+            self.app_menu.connect("show", lambda _m: self.fill_app_menu())
+            header.pack_end(menu_button)
+
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.add(outer)
+            self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+            scroll = Gtk.ScrolledWindow(vexpand=True)
+            scroll.add(self.listbox)
+            outer.pack_start(scroll, True, True, 0)
+            self.status = Gtk.Label(xalign=0)
+            self.status.set_ellipsize(Pango.EllipsizeMode.END)
+            self.status.get_style_context().add_class("dim-label")
+            self.status.set_margin_start(12)
+            self.status.set_margin_end(12)
+            self.status.set_margin_top(6)
+            self.status.set_margin_bottom(8)
+            outer.pack_start(self.status, False, False, 0)
+            self.refresh(force=True)
+            GLib.timeout_add_seconds(2, self.tick)
+            GLib.timeout_add_seconds(5, self.upkeep)
+
+        def report(self, text):
+            self.status.set_text(text)
+
+        def tick(self):
+            self.refresh()
+            return True
+
+        def upkeep(self):
+            def work():
+                Router.retake()
+                if Updater.is_due():
+                    return Updater.check()
+                return self.available_update
+            in_background(work, lambda v, _e: setattr(self, "available_update", v))
+            return True
+
+        def refresh(self, force=False):
+            profiles = list_profiles()
+            sig = [(p.id, p.name, p.pid, colour_index(p.id)) for p in profiles]
+            if not force and sig == self.signature:
+                return
+            self.signature = sig
+            self.profiles = profiles
+            for child in self.listbox.get_children():
+                self.listbox.remove(child)
+            for p in profiles:
+                self.listbox.add(self.row(p))
+            self.listbox.show_all()
+            open_count = sum(1 for p in profiles if p.pid)
+            self.header.set_subtitle("%d accounts · %d open" % (len(profiles), open_count))
+            if not self.status.get_text():
+                self.report("Each account keeps its own sign-in, chats and settings.")
+
+        def row(self, p):
+            row = Gtk.ListBoxRow(activatable=False)
+            box = Gtk.Box(spacing=12, margin=10)
+            row.add(box)
+            box.pack_start(badge(colour_index(p.id), letter(p.name), 36), False, False, 0)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER)
+            title = Gtk.Label(xalign=0)
+            title.set_markup("<b>%s</b>" % GLib.markup_escape_text(p.name))
+            detail = "Open" if p.pid else "Not open"
+            if p.is_default:
+                detail += "  ·  your original"
+            elif p.name != p.id:
+                detail += "  ·  folder: %s" % p.id
+            sub = Gtk.Label(label=detail, xalign=0)
+            sub.get_style_context().add_class("dim-label")
+            text.pack_start(title, False, False, 0)
+            text.pack_start(sub, False, False, 0)
+            box.pack_start(text, True, True, 0)
+            primary = Gtk.Button(label="Switch to" if p.pid else "Open", valign=Gtk.Align.CENTER)
+            primary.connect("clicked", lambda _b: self.open(p.id))
+            box.pack_start(primary, False, False, 0)
+            quit_ = Gtk.Button(label="Quit", valign=Gtk.Align.CENTER, sensitive=bool(p.pid))
+            quit_.connect("clicked", lambda _b: self.quit_account(p.id))
+            box.pack_start(quit_, False, False, 0)
+            more = Gtk.MenuButton(valign=Gtk.Align.CENTER)
+            more.add(Gtk.Image.new_from_icon_name("view-more-symbolic", Gtk.IconSize.BUTTON))
+            menu = Gtk.Menu()
+            items = [("Edit...", lambda: self.edit(p.id)), ("Restart", lambda: self.restart(p.id)),
+                     ("Transfer Code Chats...", lambda: self.transfer(p.id)),
+                     ("Open Folder", lambda: subprocess.Popen(["xdg-open", str(p.data_dir)], start_new_session=True))]
+            if not p.is_default:
+                items += [None, ("Delete...", lambda: self.delete(p.id))]
+            for it in items:
+                if it is None:
+                    menu.append(Gtk.SeparatorMenuItem())
+                    continue
+                mi = Gtk.MenuItem(label=it[0])
+                mi.connect("activate", lambda _m, f=it[1]: f())
+                menu.append(mi)
+            menu.show_all()
+            more.set_popup(menu)
+            box.pack_start(more, False, False, 0)
+            return row
+
+        def fill_app_menu(self):
+            for c in self.app_menu.get_children():
+                self.app_menu.remove(c)
+            if self.available_update:
+                up = Gtk.MenuItem(label="Update to %s" % self.available_update)
+                up.connect("activate", lambda _m: self.update())
+                self.app_menu.append(up)
+                self.app_menu.append(Gtk.SeparatorMenuItem())
+            route = Gtk.CheckMenuItem(label="Send Sign-ins to the Right Account", active=Router.is_on())
+            route.connect("toggled", lambda m: self.toggle_routing(m.get_active()))
+            self.app_menu.append(route)
+            launchers = Gtk.CheckMenuItem(label="Show Accounts in the App Menu", active=Launchers.installed())
+            launchers.connect("toggled", lambda m: self.toggle_launchers(m.get_active()))
+            self.app_menu.append(launchers)
+            self.app_menu.append(Gtk.SeparatorMenuItem())
+            check = Gtk.MenuItem(label="Check for Updates...")
+            check.connect("activate", lambda _m: self.update())
+            self.app_menu.append(check)
+            about = Gtk.MenuItem(label="About")
+            about.connect("activate", lambda _m: message(self, "Claude Profile Switcher %s" % VERSION,
+                                                         "Runs several Claude desktop accounts at once.\n"
+                                                         "Unofficial; not affiliated with Anthropic. MIT License.\n"
+                                                         "https://github.com/%s" % REPO))
+            self.app_menu.append(about)
+            self.app_menu.show_all()
+
+        def find(self, pid_):
+            return resolve(pid_)
+
+        def open(self, pid_):
+            p = self.find(pid_)
+            if not p:
+                return
+            try:
+                how = start(p)
+                self.report(("Switched to '%s'." if how == "focused" else "Opening '%s'...") % p.name)
+            except Exception as e:
+                message(self, "Could not open '%s'" % p.name, str(e), kind=Gtk.MessageType.ERROR)
+            GLib.timeout_add(1500, lambda: (self.refresh(), False)[1])
+
+        def add_account(self):
+            try:
+                p = add_account()
+                self.report("Added '%s'. Sign in with the other account in the Claude window that just opened." % p.name)
+            except Exception as e:
+                message(self, "Could not add an account", str(e), kind=Gtk.MessageType.ERROR)
+            GLib.timeout_add(1500, lambda: (self.refresh(force=True), False)[1])
+
+        def quit_account(self, pid_):
+            p = self.find(pid_)
+            if not p:
+                return
+            self.report("Quitting '%s'..." % p.name)
+            in_background(lambda: stop(p), lambda _r, e: (self.report(str(e) if e else "Quit '%s'." % p.name), self.refresh()))
+
+        def restart(self, pid_):
+            p = self.find(pid_)
+            if not p:
+                return
+            self.report("Restarting '%s'..." % p.name)
+            in_background(lambda: restart(p), lambda _r, e: (self.report(str(e) if e else "Restarted '%s'." % p.name), self.refresh()))
+
+        def delete(self, pid_):
+            p = self.find(pid_)
+            if not p:
+                return
+            r = message(self, "Delete '%s'?" % p.name,
+                        "Its sign-in, chats and settings in %s are removed. This cannot be undone." % p.data_dir,
+                        (("Cancel", Gtk.ResponseType.CANCEL), ("Delete", Gtk.ResponseType.OK)), Gtk.MessageType.WARNING)
+            if r != Gtk.ResponseType.OK:
+                return
+            in_background(lambda: delete_account(p), lambda _r, e: (self.report(str(e) if e else "Deleted '%s'." % p.name), self.refresh(force=True)))
+
+        def edit(self, pid_):
+            p = self.find(pid_)
+            if not p:
+                return
+            d = EditDialog(self, p)
+            resp = d.run()
+            values = (d.name.get_text().strip(), d.picked_colour(), d.env_text(), d.flags.get_text().strip(), d.flags_text)
+            d.destroy()
+            if resp != Gtk.ResponseType.OK:
+                return
+            new_name, colour, env_text, flags, old_flags = values
+            renaming = new_name and new_name != p.name
+            if renaming:
+                err = validate_name(new_name, p.id)
+                if err:
+                    message(self, "Could not save", err + " Nothing was saved.", kind=Gtk.MessageType.ERROR)
+                    return
+            env, bad = parse_env(env_text)
+            if bad:
+                message(self, "Some lines were left out", "These are not NAME=value:\n\n" + "\n".join(bad), kind=Gtk.MessageType.WARNING)
+            old_env = profile_env(p.id)
+            Settings.set_entry("ProfileEnv", p.id, env or None)
+            if flags != old_flags:
+                Settings.set_entry("ProfileArgs", p.id, flags or None)
+            if not p.is_default and colour >= 0 and colour != colour_index(p.id):
+                Settings.set_entry("ChosenColors", p.id, colour)
+            if renaming:
+                rename_account(p, new_name)
+            else:
+                Launchers.refresh()
+            self.refresh(force=True)
+            self.report("Saved '%s'." % (new_name if renaming else p.name))
+            if p.pid and (env != old_env or flags != old_flags):
+                r = message(self, "Restart '%s' to apply?" % (new_name if renaming else p.name),
+                            "It is open, and its new variables or flags apply when it starts again.",
+                            (("Later", Gtk.ResponseType.CANCEL), ("Restart", Gtk.ResponseType.OK)), Gtk.MessageType.QUESTION)
+                if r == Gtk.ResponseType.OK:
+                    self.restart(p.id)
+
+        def transfer(self, pid_):
+            src = self.find(pid_)
+            if not src:
+                return
+            chats = Chats.list(src)
+            targets = [p for p in list_profiles(False) if p.id != src.id]
+            if not chats:
+                self.report("'%s' has no Claude Code chats to transfer." % src.name)
+                return
+            if not targets:
+                self.report("Add a second account first, then transfer chats to it.")
+                return
+            d = Gtk.Dialog(title="Copy Claude Code chats from '%s'" % src.name, transient_for=self, modal=True)
+            d.set_default_size(520, 380)
+            d.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            ok = d.add_button("Copy Chats", Gtk.ResponseType.OK)
+            ok.get_style_context().add_class("suggested-action")
+            box = d.get_content_area()
+            box.set_spacing(8)
+            box.set_border_width(12)
+            info = Gtk.Label(xalign=0, label="Each chat stays here too. Finish a chat in one account before continuing it in the other.")
+            info.set_line_wrap(True)
+            box.pack_start(info, False, False, 0)
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            checks = []
+            for c in chats:
+                when = datetime.fromtimestamp(c.updated).strftime("%d %b %Y %H:%M")
+                cb = Gtk.CheckButton(label="%s   %s" % (c.title, "  ·  ".join(x for x in (c.folder, when) if x)))
+                inner.pack_start(cb, False, False, 0)
+                checks.append(cb)
+            scroll = Gtk.ScrolledWindow(vexpand=True)
+            scroll.set_shadow_type(Gtk.ShadowType.IN)
+            scroll.add(inner)
+            box.pack_start(scroll, True, True, 0)
+            row = Gtk.Box(spacing=8)
+            row.pack_start(Gtk.Label(label="Copy to"), False, False, 0)
+            combo = Gtk.ComboBoxText()
+            for t in targets:
+                combo.append_text(t.name)
+            combo.set_active(0)
+            row.pack_start(combo, False, False, 0)
+            box.pack_start(row, False, False, 0)
+            d.show_all()
+            resp = d.run()
+            picked = [c for c, cb in zip(chats, checks) if cb.get_active()]
+            target = targets[combo.get_active()]
+            d.destroy()
+            if resp != Gtk.ResponseType.OK or not picked:
+                return
+            store = Chats.store(target)
+            if not store:
+                message(self, "Not ready yet", Chats.no_store_message(target), kind=Gtk.MessageType.WARNING)
+                return
+            copied = sum(1 for c in picked if Chats.copy(c, store))
+            msg = "Copied %d chat(s) to '%s'." % (copied, target.name)
+            if copied < len(picked):
+                msg += " %d were already there." % (len(picked) - copied)
+            if resolve(target.id) and resolve(target.id).pid:
+                msg += " Quit and reopen it to see them."
+            self.report(msg)
+
+        def toggle_routing(self, on):
+            try:
+                if on and not Router.is_on():
+                    Router.enable()
+                    self.report("Sign-ins now go to the account that asked for them.")
+                elif not on and Router.is_on():
+                    Router.disable()
+                    self.report("Sign-in routing is off.")
+            except Exception as e:
+                message(self, "Could not change sign-in routing", str(e), kind=Gtk.MessageType.ERROR)
+
+        def toggle_launchers(self, on):
+            try:
+                if on:
+                    Launchers.write_all()
+                    self.report("Each account is now in the app menu, with its own icon.")
+                else:
+                    Launchers.remove_all()
+                    self.report("Removed the accounts from the app menu.")
+            except Exception as e:
+                message(self, "Could not change the app menu", str(e), kind=Gtk.MessageType.ERROR)
+
+        def update(self):
+            self.report("Looking for a newer switcher...")
+
+            def done(v, e):
+                if e:
+                    r = message(self, "Could not update", "%s\n\nThe releases page has every version." % e,
+                                (("Close", Gtk.ResponseType.CLOSE), ("Open Releases", Gtk.ResponseType.OK)), Gtk.MessageType.WARNING)
+                    if r == Gtk.ResponseType.OK:
+                        subprocess.Popen(["xdg-open", "https://github.com/%s/releases/latest" % REPO], start_new_session=True)
+                    self.report("")
+                elif v:
+                    self.available_update = None
+                    message(self, "Updated to %s" % v, "The switcher restarts to finish. Your accounts are not touched.")
+                    os.execv(sys.executable, [sys.executable, switcher_command()])
+                else:
+                    self.available_update = None
+                    self.report("Claude Profile Switcher %s is the newest release." % VERSION)
+            in_background(Updater.install, done)
+
+    def capture(widget_window, path):
+        gdkwin = widget_window.get_window()
+        w, h = gdkwin.get_width(), gdkwin.get_height()
+        pix = Gdk.pixbuf_get_from_window(gdkwin, 0, 0, w, h)
+        pix.savev(path, "png", [], [])
+
+    app = Gtk.Application(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+    state = {"window": None}
+
+    def activate(a):
+        if state["window"] is None:
+            state["window"] = Window(a)
+        state["window"].show_all()
+        state["window"].present()
+        if snapshot or snapshot_edit:
+            def shoot():
+                win = state["window"]
+                if snapshot_edit:
+                    p = resolve_or_throw(snapshot_edit[1])
+                    dlg = EditDialog(win, p)
+                    dlg.show_all()
+                    GLib.timeout_add(900, lambda: (capture(dlg, snapshot_edit[0]), a.quit(), False)[2])
+                else:
+                    capture(win, snapshot)
+                    a.quit()
+                return False
+            GLib.timeout_add(1200, shoot)
+
+    app.connect("activate", activate)
+    if snapshot or snapshot_edit:
+        # A one-off render: never hand over to (or become) the running window.
+        app.set_flags(Gio.ApplicationFlags.NON_UNIQUE)
+    return app.run([sys.argv[0]])
+
+
+def parse_env(text):
+    env, bad = {}, []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, eq, value = line.partition("=")
+        if not eq or not ENV_NAME.match(name.strip()):
+            bad.append(line)
+            continue
+        env[name.strip()] = value
+    return env, bad
+
+
+# --------------------------------------------------------------------------- command line --
+
+USAGE = """claude-switcher: run several Claude desktop accounts at once (Linux)
+
+With no arguments it opens the window. Commands:
+  --list                      Accounts, whether each is open, and their folders
+  --add-account               Make a new account and open it to sign in
+  --launch NAME               Open an account, or bring it forward if open
+  --quit NAME                 Quit one account
+  --restart NAME              Quit and reopen it
+  --rename NAME NEW-NAME      Change its label (the folder stays)
+  --delete NAME               Delete an account and its folder
+  --edit NAME [--name NEW] [--color 0-7] [--flags "..."] [--env K=V ...] [--clear-env]
+                              Change an account's name, colour, launch flags or variables
+  --chats NAME                That account's Claude Code chats
+  --transfer FROM TO [--all | --chat ID ...]
+                              Copy Claude Code chats to another account
+  --install-launchers         Put each account in the app menu with its own icon
+  --remove-launchers          Take them out again
+  --route-sign-ins            Send each browser sign-in to the account that asked for it
+  --revert                    Give claude:// links back to Claude
+  --open-links-in NAME        Where other claude:// links open while routing is on
+  --open-link URL [--account NAME]
+                              Open a claude:// link in one account
+  --status                    Sign-in routing and the claude:// handler
+  --check-update              Is there a newer switcher?
+  --update                    Install it (checksum verified)
+  --doctor                    What a bug report needs, user name redacted
+  --uninstall [--remove-profiles]
+                              Remove what the switcher made outside your accounts
+  --claude-path PATH          Use this Claude (remembered)
+  --version                   Print the version
+"""
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="claude-switcher", usage=USAGE, add_help=False)
+    a = ap.add_argument
+    a("-h", "--help", action="store_true")
+    a("--version", action="store_true")
+    a("--list", action="store_true")
+    a("--add-account", action="store_true")
+    a("--launch")
+    a("--quit")
+    a("--restart")
+    a("--rename", nargs=2)
+    a("--delete")
+    a("--edit")
+    a("--name")
+    a("--color", type=int)
+    a("--flags")
+    a("--env", action="append")
+    a("--clear-env", action="store_true")
+    a("--chats")
+    a("--transfer", nargs=2)
+    a("--all", action="store_true")
+    a("--chat", action="append")
+    a("--install-launchers", action="store_true")
+    a("--remove-launchers", action="store_true")
+    a("--route-sign-ins", action="store_true")
+    a("--revert", action="store_true")
+    a("--open-links-in")
+    a("--open-link")
+    a("--account")
+    a("--status", action="store_true")
+    a("--handle-link")
+    a("--hold-handler", action="store_true")
+    a("--check-update", action="store_true")
+    a("--update", action="store_true")
+    a("--doctor", action="store_true")
+    a("--uninstall", action="store_true")
+    a("--remove-profiles", action="store_true")
+    a("--claude-path")
+    a("--snapshot")
+    a("--snapshot-edit")
+    a("--appearance", choices=["light", "dark"])
+    return ap
+
+
+def main(argv):
+    ap = build_parser()
+
+    def bad_usage(msg):
+        raise SwitcherError("%s\n\n%s" % (msg, USAGE))
+    ap.error = bad_usage
+    o = ap.parse_args(argv)
+
+    if o.help:
+        print(USAGE)
+        return 0
+    if o.version:
+        print(VERSION)
+        return 0
+    if o.claude_path:
+        if not os.access(o.claude_path, os.X_OK):
+            raise SwitcherError("%s is not an executable file." % o.claude_path)
+        Settings.set("ClaudePath", os.path.abspath(o.claude_path))
+        print("Using %s." % os.path.abspath(o.claude_path))
+        if not any([o.list, o.launch, o.add_account]):
+            return 0
+    if o.handle_link is not None:
+        Router.handle(o.handle_link)
+        return 0
+    if o.hold_handler:
+        Router.hold_loop(20)
+        return 0
+    if o.list:
+        print(list_text())
+        return 0
+    if o.doctor:
+        print(doctor())
+        return 0
+    if o.uninstall:
+        for line in uninstall(o.remove_profiles):
+            print("- " + line)
+        return 0
+    if o.add_account:
+        p = add_account()
+        print("Added '%s'. Sign in with the other account in the Claude window that just opened." % p.name)
+        return 0
+    if o.launch:
+        p = resolve_or_throw(o.launch)
+        how = start(p)
+        print(("Switched to '%s'." if how == "focused" else "Opened '%s'.") % p.name)
+        return 0
+    if o.quit:
+        p = resolve_or_throw(o.quit)
+        print(("Quit '%s'." if stop(p) else "'%s' was not open.") % p.name)
+        return 0
+    if o.restart:
+        p = resolve_or_throw(o.restart)
+        restart(p)
+        print("Restarted '%s'." % p.name)
+        return 0
+    if o.rename:
+        p = resolve_or_throw(o.rename[0])
+        rename_account(p, o.rename[1])
+        print("Renamed '%s' to '%s'." % (p.name, o.rename[1].strip()))
+        return 0
+    if o.delete:
+        p = resolve_or_throw(o.delete)
+        delete_account(p)
+        print("Deleted '%s'." % p.name)
+        return 0
+    if o.edit:
+        p = resolve_or_throw(o.edit)
+        if o.name:
+            err = validate_name(o.name, p.id)
+            if err:
+                raise SwitcherError(err + " Nothing was saved.")
+        if o.color is not None:
+            if p.is_default:
+                raise SwitcherError("The Default profile keeps Claude's own icon.")
+            Settings.set_entry("ChosenColors", p.id, o.color % len(PALETTE))
+        if o.flags is not None:
+            Settings.set_entry("ProfileArgs", p.id, o.flags.strip() or None)
+        if o.clear_env or o.env:
+            env = {} if o.clear_env else profile_env(p.id)
+            more, bad = parse_env("\n".join(o.env or []))
+            if bad:
+                raise SwitcherError("Not NAME=value: %s" % ", ".join(bad))
+            env.update(more)
+            Settings.set_entry("ProfileEnv", p.id, env or None)
+        if o.name:
+            rename_account(p, o.name)
+        else:
+            Launchers.refresh()
+        print("Saved '%s'.%s" % (o.name or p.name, " Restart it to apply the new flags or variables." if p.pid and (o.flags is not None or o.env or o.clear_env) else ""))
+        return 0
+    if o.chats:
+        p = resolve_or_throw(o.chats)
+        for c in Chats.list(p):
+            print("%s  %s  %s  %s" % (c.id, datetime.fromtimestamp(c.updated, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), c.folder or "-", c.title))
+        return 0
+    if o.transfer:
+        src, dst = resolve_or_throw(o.transfer[0]), resolve_or_throw(o.transfer[1])
+        if src.id == dst.id:
+            raise SwitcherError("Pick two different accounts.")
+        wanted = o.chat or []
+        chats = [c for c in Chats.list(src) if o.all or c.id in wanted or c.file.name in wanted]
+        if not chats:
+            raise SwitcherError("No chats picked. Use --all, or --chat with ids from --chats \"%s\"." % src.name)
+        store = Chats.store(dst)
+        if not store:
+            raise SwitcherError(Chats.no_store_message(dst))
+        copied = sum(1 for c in chats if Chats.copy(c, store))
+        skipped = len(chats) - copied
+        print("Copied %d chat(s) to '%s'.%s" % (copied, dst.name, " %d were already there." % skipped if skipped else ""))
+        return 0
+    if o.install_launchers:
+        Launchers.write_all()
+        print("Each account is in the app menu now, with its own icon, and the switcher's entry lists them "
+              "(right-click it in the dock). Files: %s" % APPS_DIR)
+        return 0
+    if o.remove_launchers:
+        print("Removed %d file(s)." % Launchers.remove_all())
+        return 0
+    if o.route_sign_ins:
+        Router.enable()
+        print("Sign-ins now go to the account that asked for them. claude:// links open in: %s." % Router.handler())
+        return 0
+    if o.revert:
+        Router.disable()
+        print("Sign-in routing is off. claude:// links open in: %s." % (Router.handler() or "the system default"))
+        return 0
+    if o.status:
+        print(Router.status_text())
+        return 0
+    if o.open_links_in:
+        if o.open_links_in == DEFAULT_ID:
+            Settings.set("OpenLinksIn", None)
+            print("Other links open in 'Default'.")
+            return 0
+        p = resolve_or_throw(o.open_links_in)
+        Settings.set("OpenLinksIn", None if p.is_default else p.id)
+        print("Other links open in '%s'." % p.name)
+        return 0
+    if o.open_link:
+        if not Router.is_safe(o.open_link):
+            raise SwitcherError("That is not a claude:// link.")
+        target = resolve_or_throw(o.account) if o.account else (Router.other_link_target() or resolve_or_throw(DEFAULT_ID))
+        how = Router.deliver(o.open_link, target)
+        print("Opened the link in '%s' (%s)." % (target.name, how))
+        return 0
+    if o.check_update:
+        v = Updater.check()
+        print("Version %s is available (this is %s). Install it with --update." % (v, VERSION) if v
+              else "Claude Profile Switcher %s is up to date." % VERSION)
+        return 0
+    if o.update:
+        v = Updater.install()
+        print("Updated to %s." % v if v else "Claude Profile Switcher %s is up to date." % VERSION)
+        return 0
+    if o.snapshot or o.snapshot_edit:
+        edit = (o.snapshot_edit, o.account) if o.snapshot_edit else None
+        if edit and not o.account:
+            raise SwitcherError("--snapshot-edit needs --account NAME.")
+        return run_gui(snapshot=o.snapshot, appearance=o.appearance, snapshot_edit=edit)
+    if argv:
+        raise SwitcherError("Unknown arguments: %s\n\n%s" % (" ".join(argv), USAGE))
+    return run_gui()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except SwitcherError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
