@@ -1789,7 +1789,9 @@ function Install-Watchdog {
     $cmd    = Get-WatchdogCommand
     $action = New-ScheduledTaskAction -Execute $cmd.Execute -Argument $cmd.Argument
     $user   = "$env:USERDOMAIN\$env:USERNAME"
-    $every  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2) -RepetitionDuration ([TimeSpan]::MaxValue)
+    # No -RepetitionDuration: left out, it repeats indefinitely. [TimeSpan]::MaxValue, the
+    # documented-looking alternative, is refused by Task Scheduler as out of range.
+    $every  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2)
     $logon  = New-ScheduledTaskTrigger -AtLogOn -User $user
     $logon.Repetition = $every.Repetition
     $settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
