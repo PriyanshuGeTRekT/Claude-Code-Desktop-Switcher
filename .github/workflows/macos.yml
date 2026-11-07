@@ -1,0 +1,36 @@
+name: macOS
+
+on:
+  push:
+    branches: [main]
+    paths: ['macos/**', '.github/workflows/macos.yml']
+  pull_request:
+    paths: ['macos/**', '.github/workflows/macos.yml']
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build, test and screenshot
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build the app (Apple Silicon and Intel)
+        run: bash macos/build.sh "$RUNNER_TEMP/build"
+
+      - name: End-to-end tests against a stand-in Claude.app
+        run: bash macos/tests/run-tests.sh "$RUNNER_TEMP/build/Claude Profile Switcher.app/Contents/MacOS/ClaudeSwitcher" "$RUNNER_TEMP/shots"
+
+      - name: Upload the app
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeProfileSwitcher-macOS
+          path: ${{ runner.temp }}/build/ClaudeProfileSwitcher-macOS.zip
+
+      - name: Upload the screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-screenshots
+          path: ${{ runner.temp }}/shots
