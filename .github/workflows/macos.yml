@@ -11,7 +11,7 @@ on:
 jobs:
   build-and-test:
     name: Build, test and screenshot
-    runs-on: macos-14
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v5
