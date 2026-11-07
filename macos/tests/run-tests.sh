@@ -51,6 +51,10 @@ out="$(sw --add-account)"
 check "--add-account reports Account 2" 'echo "$out" | grep -q "Added .Account 2."'
 check "Account 2 folder made" '[ -d "$CLAUDE_SWITCHER_SUPPORT_DIR/ClaudeProfiles/Account 2" ]'
 check "Account 2 opened" 'wait_open "Account 2" open'
+echo "  --- diagnostics: ps lines for the stand-in, and what the switcher lists"
+ps -axww -o pid=,args= | grep -F "Fake Apps" | grep -v grep | sed "s/^/      /"
+echo "      CLAUDE_SWITCHER_APP=$CLAUDE_SWITCHER_APP"
+sw --list | sed "s/^/      /"
 check "it was started with its own folder (path with spaces)" 'grep -qF "args=[--user-data-dir=$CLAUDE_SWITCHER_SUPPORT_DIR/ClaudeProfiles/Account 2]" "$log"'
 before="$(open_count)"
 out="$(sw --launch "Account 2")"
