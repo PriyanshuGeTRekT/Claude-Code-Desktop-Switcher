@@ -204,7 +204,7 @@ $script:DefaultName     = 'Default'
 $script:ScriptPath      = $MyInvocation.MyCommand.Path
 # Bumped with each release (see CONTRIBUTING). Not named $script:Version: that would
 # silently overwrite the -Version switch, the case-insensitive trap from CONTRIBUTING.
-$script:SwitcherVersion = '2.3.0'
+$script:SwitcherVersion = '2.4.0'
 $script:RouterLogPath   = Join-Path $script:SwitcherHome 'sign-in-router.log'
 
 function Test-HandleLinkAlone {

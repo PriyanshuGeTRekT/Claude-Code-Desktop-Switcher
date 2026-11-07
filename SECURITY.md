@@ -2,9 +2,10 @@
 
 ## Scope
 
-This tool is a launcher. It creates directories under `%LOCALAPPDATA%`,
-starts the Claude desktop app with a `--user-data-dir` argument, and creates shortcuts.
-It does not modify the Claude application or handle credentials.
+This tool is a launcher. It creates a folder per account (under `%LOCALAPPDATA%` on Windows,
+`~/Library/Application Support/ClaudeProfiles` on macOS, `~/.config/ClaudeProfiles` on
+Linux), starts the Claude desktop app with a `--user-data-dir` argument, and creates
+shortcuts or launchers. It does not modify the Claude application or handle credentials.
 
 Its only network requests are for its own updates, to this repository's GitHub releases:
 once a day the window fetches the latest release's `SHA256SUMS.txt` (about 300 bytes),
@@ -31,6 +32,24 @@ forced close from a quit, and starts Claude; nothing else. `-RemoveWatchdog` del
 `-Uninstall` (or the tray's **Uninstall...**) removes all of that: shortcuts, the task, the
 `claude://` handler and the installed copy. Accounts and settings stay unless you add
 `-RemoveProfiles`.
+
+### macOS and Linux
+
+The same rules apply. Updates: once a day (unless `"UpdateCheck": false`) one HEAD request to
+this repository's latest release, to read its version; a newer release is downloaded and
+installed only when it matches the release's `SHA256SUMS.txt`. On macOS the new app must also
+pass `codesign --verify --deep --strict` and carry the switcher's bundle id.
+
+Sign-in routing validates links in the same way and never logs them. On macOS it registers the
+app as the `claude://` handler with Launch Services and sends the link to one Claude process as
+a GetURL Apple Event, which macOS lets you allow or refuse once. On Linux it writes one line to
+your `~/.config/mimeapps.list` and a hidden `claude-profile-router.desktop`, and remembers the
+previous handler so `--revert` restores it.
+
+Keep running on macOS installs a per-user launch agent
+(`io.github.priyanshugetrekt.claude-profile-switcher.watchdog`) that runs the app with
+`--watch` every two minutes; Open at Login installs a second one. The Linux app menu launchers
+are `.desktop` files and SVG icons under `~/.local/share`. `--uninstall` removes all of these.
 
 Profile directories contain live login sessions for whichever account signed in there.
 Treat them like any other browser profile. Anyone with read access to your user account

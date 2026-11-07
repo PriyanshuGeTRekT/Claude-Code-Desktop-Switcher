@@ -158,10 +158,28 @@ temporary folder, so they never touch a real Claude or real accounts. CI runs th
 screenshots as artifacts. Keep `switcherVersion` in the Swift file equal to
 `$script:SwitcherVersion` in `ClaudeSwitcher.ps1`.
 
+## Linux
+
+The Linux app is `linux/claude-switcher`, one Python 3 file using only the standard library,
+plus GTK 3 through `python3-gi` for the window. On Ubuntu or Debian:
+
+    sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 xvfb desktop-file-utils gcc
+    bash linux/tests/run-tests.sh shots      # end-to-end tests, then screenshots into shots/
+    bash linux/build.sh dist                 # the .deb, the tarball and the bare program
+
+The tests compile a stand-in Claude (`linux/tests/fake-claude.c`) that behaves like Electron:
+helper processes with `--type=`, and a second start on the same folder handed to the first
+copy. HOME and the XDG folders point into a temporary folder, so your real accounts, launchers
+and `mimeapps.list` are never touched. CI runs the same, plus pyflakes and shellcheck, on
+every change under `linux/`. Keep `VERSION` equal to the other two versions.
+
 ## Releasing
 
-Bump `$script:SwitcherVersion` near the top of `ClaudeSwitcher.ps1` in the same change
-that goes into a release; `-Version` and the window's status line show it, and bug
+Bump the version in all three apps in the same change that goes into a release:
+`$script:SwitcherVersion` in `ClaudeSwitcher.ps1`, `switcherVersion` in
+`macos/ClaudeSwitcher.swift` and `VERSION` in `linux/claude-switcher`. The release's
+`SHA256SUMS.txt` must list `ClaudeProfileSwitcher-macOS.zip` and `claude-switcher` as well, since
+the Mac and Linux updaters check against it. For Windows, `-Version` and the window's status line show it, and bug
 reports quote it. The self-update compares that number with the one in the latest
 release's `ClaudeSwitcher.ps1` (verified against the release's `SHA256SUMS.txt`), so a
 release whose version was not bumped is never offered as an update.

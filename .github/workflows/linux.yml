@@ -35,7 +35,7 @@ jobs:
 
       - name: The .deb installs and runs
         run: |
-          sudo apt-get install -yq "$RUNNER_TEMP"/dist/claude-profile-switcher_*_all.deb
+          sudo apt-get install -yq "$RUNNER_TEMP"/dist/claude-profile-switcher_all.deb
           claude-switcher --version
           desktop-file-validate /usr/share/applications/claude-profile-switcher.desktop
 
