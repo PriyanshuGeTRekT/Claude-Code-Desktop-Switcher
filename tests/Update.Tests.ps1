@@ -3,7 +3,7 @@ $source = Join-Path (Split-Path $PSScriptRoot -Parent) 'ClaudeSwitcher.ps1'
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$null, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in @('Get-PublishedHash', 'Get-ScriptVersion', 'Compare-SwitcherVersion', 'Test-DownloadedScript', 'Get-UpdateTarget', 'New-TempFileName')) {
+foreach ($name in @('Get-PublishedHash', 'Get-ScriptVersion', 'Compare-SwitcherVersion', 'Test-DownloadedScript', 'Get-UpdateTarget', 'Get-UpdateTargetVersion', 'New-TempFileName')) {
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}, $true)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
@@ -61,4 +61,16 @@ Assert ((Get-UpdateTarget) -eq $source) 'Without an installed copy the running s
 try { Assert ((Get-UpdateTarget) -eq $script:InstalledScript) 'The installed copy should be the target' }
 finally { Remove-Item -LiteralPath $script:InstalledScript -Force -ErrorAction SilentlyContinue }
 
-Write-Output 'PASS: published checksum parsing, version line, version order, downloaded script accepted or refused (checksum, parse), no version for old releases, update target.'
+# The version compared is the target's, not the running script's: a repo copy running
+# while an older installed copy exists must compare with the installed one.
+$script:SwitcherVersion = '9.9.9'
+$script:InstalledScript = New-TempFileName -Suffix '.ps1'
+try {
+    [IO.File]::WriteAllText($script:InstalledScript, "`$script:SwitcherVersion = '2.1.0'`r`n")
+    Assert ((Get-UpdateTargetVersion) -eq '2.1.0') "Target version: $(Get-UpdateTargetVersion)"
+    [IO.File]::WriteAllText($script:InstalledScript, "Write-Output 'from before the version line'`r`n")
+    Assert ((Get-UpdateTargetVersion) -eq '0') 'An installed copy without a version should count as 0'
+} finally { Remove-Item -LiteralPath $script:InstalledScript -Force -ErrorAction SilentlyContinue }
+Assert ((Get-UpdateTargetVersion) -eq '9.9.9') 'Without an installed copy the running version should be used'
+
+Write-Output 'PASS: published checksum parsing, version line, version order, downloaded script accepted or refused (checksum, parse), no version for old releases, update target, the version of the target.'

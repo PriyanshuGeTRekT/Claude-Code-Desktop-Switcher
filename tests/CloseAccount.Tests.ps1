@@ -16,13 +16,27 @@ $child = Start-Process -FilePath $engine -ArgumentList '-NoProfile', '-Command',
 try {
     Assert (-not $child.HasExited) 'Stand-in process did not start'
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    Stop-ProcessGroup -ProcessIds @($child.Id) -MainProcessId $child.Id -GraceSeconds 1
+    $left = @(Stop-ProcessGroup -ProcessIds @($child.Id) -MainProcessId $child.Id -GraceSeconds 1)
+    Assert ($left.Count -eq 0) 'An ended process was reported as still running'
     Assert ($child.HasExited) 'Process still running after Stop-ProcessGroup'
     Assert ($sw.Elapsed.TotalSeconds -lt 20) "Stopping took $([int]$sw.Elapsed.TotalSeconds) s"
     # A process that is already gone is not an error.
     Stop-ProcessGroup -ProcessIds @($child.Id) -MainProcessId $child.Id -GraceSeconds 1
 } finally {
     if (-not $child.HasExited) { Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue }
+}
+
+# Windows refusing to end a process (an elevated Claude): Stop-Process fails, and the
+# survivor is reported back instead of being taken for closed.
+$child = Start-Process -FilePath $engine -ArgumentList '-NoProfile', '-Command', 'Start-Sleep 120' -PassThru -WindowStyle Hidden
+try {
+    function Stop-Process { param($Id, [switch]$Force, $ErrorAction) throw 'Access is denied' }
+    $left = @(Stop-ProcessGroup -ProcessIds @($child.Id) -MainProcessId $child.Id -GraceSeconds 1)
+    Remove-Item Function:\Stop-Process
+    Assert ($left.Count -eq 1 -and $left[0] -eq $child.Id) "A process that would not end was not reported: $($left -join ',')"
+} finally {
+    if (Test-Path Function:\Stop-Process) { Remove-Item Function:\Stop-Process }
+    if (-not $child.HasExited) { Microsoft.PowerShell.Management\Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue }
 }
 
 # The family of a process with no Claude.exe children is the process alone.
@@ -33,4 +47,4 @@ Assert ($family.Count -eq 1 -and $family[0] -eq $PID) "Unexpected family: $($fam
 $out = & $engine -NoProfile -ExecutionPolicy Bypass -File $source -Version 2>&1
 Assert ("$out" -match '^\d+\.\d+\.\d+\S*$') "Unexpected -Version output: $out"
 
-Write-Output 'PASS: stand-in process ended and waited for, already-gone process tolerated, process family, -Version without Claude.'
+Write-Output 'PASS: stand-in process ended and waited for, refused termination reported, already-gone process tolerated, process family, -Version without Claude.'
