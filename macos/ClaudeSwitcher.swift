@@ -1084,7 +1084,7 @@ final class AccountsWindow: NSObject, NSWindowDelegate {
             keep.frame = NSRect(x: 0, y: 14, width: 420, height: 22)
             keep.state = AccountSettings.isKept(p.id) ? .on : .off
             view.addSubview(keep)
-            label("Reopened within two minutes when they close it. Quitting it yourself leaves it closed.", -2, small: true)
+            label("Reopened when an update or restart closes it, not when you quit it.", -2, small: true)
         }
     }
 
@@ -1513,7 +1513,8 @@ func runCommandLine(_ args: [String]) throws -> Bool {
             NSColor.windowBackgroundColor.setFill()
             NSRect(origin: .zero, size: rep.size).fill()
         }
-        rep.draw(in: NSRect(origin: .zero, size: rep.size))
+        // A bitmap draws with .copy by default, which would wipe the backdrop.
+        rep.draw(in: NSRect(origin: .zero, size: rep.size), from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: false, hints: nil)
         NSGraphicsContext.restoreGraphicsState()
         guard let png = out.representation(using: .png, properties: [:]) else { throw SwitcherError("Could not render the dialog.") }
         try png.write(to: URL(fileURLWithPath: path))
