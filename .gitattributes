@@ -10,3 +10,8 @@
 *.yaml text eol=lf
 LICENSE text eol=lf
 .gitignore text eol=lf
+
+# macOS sources and scripts run on macOS, where a CRLF breaks bash and plist parsing.
+*.sh    text eol=lf
+*.swift text eol=lf
+*.plist text eol=lf
