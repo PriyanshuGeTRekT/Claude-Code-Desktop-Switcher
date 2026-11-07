@@ -16,7 +16,8 @@ pass() { echo "  ok    $1"; }
 fail() { echo "  FAIL  $1"; fails=$((fails + 1)); }
 check() { if eval "$2"; then pass "$1"; else fail "$1"; fi }
 sw() { "$bin" "$@" 2>&1; }
-open_count() { pgrep -f "$CLAUDE_SWITCHER_APP/Contents/MacOS/Claude" | wc -l | tr -d ' '; }
+# Matched without the temp folder prefix: ps shows /var as /private/var.
+open_count() { pgrep -f "Fake Apps/Claude.app/Contents/MacOS/Claude" | wc -l | tr -d ' '; }
 wait_open() {  # account name, then expected state: open or not
     for _ in $(seq 1 40); do
         if sw --list | grep -F "$1" | grep -q "open (pid" ; then [ "$2" = open ] && return 0; else [ "$2" = closed ] && return 0; fi
@@ -109,7 +110,7 @@ if [ -n "$shots" ]; then
     sw --quit Work >/dev/null; sw --quit Default >/dev/null
 fi
 
-pkill -f "$CLAUDE_SWITCHER_APP/Contents/MacOS/Claude" 2>/dev/null
+pkill -f "Fake Apps/Claude.app/Contents/MacOS/Claude" 2>/dev/null
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: all macOS checks"; else echo "FAILED: $fails check(s)"; echo "--- stand-in log"; cat "$log"; fi
 exit "$fails"

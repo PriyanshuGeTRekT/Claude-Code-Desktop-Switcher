@@ -195,14 +195,17 @@ enum Processes {
     /// its exact --user-data-dir= text followed by a space or the end of the line.
     static func runningMap(profileIDs: [String]) -> [String: pid_t] {
         guard let app = ClaudeApp.find() else { return [:] }
-        let exe = ClaudeApp.executable(of: app)
+        // ps shows the path the kernel resolved, so /var/... appears as /private/var/...;
+        // either spelling counts.
+        let given = ClaudeApp.executable(of: app)
+        let exes = Array(Set([given, URL(fileURLWithPath: given).resolvingSymlinksInPath().path]))
         let flags = profileIDs.filter { $0 != defaultID }.map { ($0, "--user-data-dir=" + Loc.profileDir($0).path) }
         var map: [String: pid_t] = [:]
         for line in psLines() {
             let t = line.trimmingCharacters(in: .whitespaces)
             guard let space = t.firstIndex(of: " "), let pid = pid_t(t[..<space]) else { continue }
             let args = String(t[t.index(after: space)...])
-            guard args == exe || args.hasPrefix(exe + " "), !args.contains("--type=") else { continue }
+            guard exes.contains(where: { args == $0 || args.hasPrefix($0 + " ") }), !args.contains("--type=") else { continue }
             if let hit = flags.first(where: { args.contains($0.1 + " ") || args.hasSuffix($0.1) }) {
                 if map[hit.0] == nil { map[hit.0] = pid }
             } else if !args.contains("--user-data-dir=") {
@@ -260,11 +263,11 @@ enum Launcher {
     }
 
     /// Through `open`, so Launch Services starts Claude as an app of its own: it outlives
-    /// a closed Terminal, and an extra account gets its own Dock icon (-n).
+    /// a closed Terminal, and each account gets its own Dock icon. Always -n: without it,
+    /// Launch Services only brings forward whichever copy of Claude is already running,
+    /// which may be another account. Only an account found not running is started.
     static func openArguments(app: URL, profile: Profile) -> [String] {
-        var a: [String] = []
-        if !profile.isDefault { a.append("-n") }
-        a += ["-a", app.path]
+        var a = ["-n", "-a", app.path]
         for (k, v) in env(profile.id) { a += ["--env", "\(k)=\(v)"] }
         var pass = profile.isDefault ? [] : ["--user-data-dir=\(profile.dataDir.path)"]
         pass += extraArgs(profile.id)
