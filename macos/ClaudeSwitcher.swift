@@ -196,9 +196,11 @@ enum Processes {
     static func runningMap(profileIDs: [String]) -> [String: pid_t] {
         guard let app = ClaudeApp.find() else { return [:] }
         // ps shows the path the kernel resolved, so /var/... appears as /private/var/...;
-        // either spelling counts.
+        // either spelling counts. realpath(3), because Foundation's resolvingSymlinksInPath
+        // strips a leading /private again on purpose.
         let given = ClaudeApp.executable(of: app)
-        let exes = Array(Set([given, URL(fileURLWithPath: given).resolvingSymlinksInPath().path]))
+        var exes = [given]
+        if let r = realpath(given, nil) { exes.append(String(cString: r)); free(r) }
         let flags = profileIDs.filter { $0 != defaultID }.map { ($0, "--user-data-dir=" + Loc.profileDir($0).path) }
         var map: [String: pid_t] = [:]
         for line in psLines() {
