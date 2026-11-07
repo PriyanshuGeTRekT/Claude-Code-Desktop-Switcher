@@ -26,6 +26,7 @@
 | **Concurrent accounts** | Every account runs in its own window. Open as many as you like at the same time. |
 | **One click to switch** | Launch a profile, or bring it to the front if it is already open. Close or restart it from the same place. Also from the tray. |
 | **Move Claude Code chats** | Copy chats from one account to another and carry on where you left off. |
+| **Survives Claude's updates** | Mark an account as kept running and it comes back within two minutes when an update, a logoff or a restart closed it. |
 | **Sign-ins land in the right account** | Optional: a browser sign-in comes back to the account that asked for it, not to your original one. |
 | **Icons you can tell apart** | Each profile gets a coloured badge for its shortcuts and its own taskbar button. |
 | **Nothing to install** | One PowerShell script. No patching, no proxy, no credential juggling. |
@@ -79,7 +80,7 @@ You can also add an account without opening the switcher: search Start for
 | Close an account's Claude | **Close**, or the tray's **Close** entry | |
 | Restart it (picks up changed flags or variables) | right-click, **Restart** | |
 | Add an account, opens straight to sign-in | **Add account** | <kbd>Ctrl</kbd>+<kbd>N</kbd> |
-| Name, badge colour, environment variables, launch flags | **Edit...** | <kbd>F2</kbd> |
+| Name, badge colour, environment variables, launch flags, keep running | **Edit...** | <kbd>F2</kbd> |
 | Desktop and Start menu shortcuts | **Add shortcuts** | |
 | Copy Claude Code chats to another account | **Transfer chats** | |
 | Delete a profile and its shortcuts | **Delete** | <kbd>Del</kbd> |
@@ -115,6 +116,22 @@ there, whether routing is on or not. `-Status` shows where other links go.
 > otherwise, and only you can make that choice. Turning this on opens Settings at the right
 > page: set **CLAUDE** to **Claude Profile Router**. `-Status` shows whether that step is
 > still to do.
+
+### Keeping accounts open through Claude's updates
+
+When the Claude desktop app installs an update while idle, Windows closes every copy of
+it, your extra accounts included, and the app brings back only your original one. The
+same happens at logoff and restart. For an account that has to stay up (Remote Control,
+scheduled tasks, long Claude Code sessions), open **Edit...** and tick **Keep running**, or
+run `-KeepRunning Work`.
+
+That creates one per-user scheduled task that looks every two minutes and at logon. It
+reopens a kept account only when that account's own log ends in a forced close; an account
+you closed yourself stays closed. It waits while an update is still being applied, reopens
+each account minimized, never brings a window to the front, and never reopens the same
+account twice within ten minutes. Everything it does is written to
+`%LOCALAPPDATA%\ClaudeProfiles\.switcher\watchdog.log`. Untick the box, or run
+`-StopKeeping Work`, and the task is removed once nothing is kept.
 
 ### Shortcuts
 
@@ -189,6 +206,9 @@ same two limits apply: a copy that is already open keeps the flags it started wi
 | `.\ClaudeSwitcher.ps1 -Restart Work` | Close it if open, then open it again |
 | `.\ClaudeSwitcher.ps1 -Version` | Print the switcher's version |
 | `.\ClaudeSwitcher.ps1 -Update` | Install the latest release if it is newer |
+| `.\ClaudeSwitcher.ps1 -KeepRunning Work` | Reopen that account after a Claude update, a logoff or a restart closes it |
+| `.\ClaudeSwitcher.ps1 -StopKeeping Work` | Stop doing that |
+| `.\ClaudeSwitcher.ps1 -InstallWatchdog` / `-RemoveWatchdog` | Create or delete the scheduled task behind it |
 | `.\ClaudeSwitcher.ps1 -List` | Print profiles and which are running |
 | `.\ClaudeSwitcher.ps1 -Shortcut Work` | Desktop and Start menu shortcuts for one profile |
 | `.\ClaudeSwitcher.ps1 -Shortcut Work -To <dir>` | A shortcut in a folder of your choice |

@@ -23,6 +23,11 @@ line. The handler refuses to run when anything other than the link is passed to 
 never writes a link to its log, because a sign-in link carries a one-time code. Reports
 about this part are especially welcome.
 
+If you mark an account as kept running, the switcher creates one per-user scheduled task
+(`Claude Profile Switcher watchdog`, no admin rights) that runs the script with `-Watch`
+every two minutes and at logon. It reads each kept account's own `logs\main.log` to tell a
+forced close from a quit, and starts Claude; nothing else. `-RemoveWatchdog` deletes it.
+
 Profile directories contain live login sessions for whichever account signed in there.
 Treat them like any other browser profile. Anyone with read access to your user account
 can use them, and deleting a profile directory signs that account out on that machine.

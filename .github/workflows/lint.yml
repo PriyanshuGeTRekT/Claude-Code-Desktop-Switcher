@@ -97,6 +97,14 @@ jobs:
         shell: pwsh
         run: .\tests\Update.Tests.ps1
 
+      - name: Watchdog tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\Watchdog.Tests.ps1
+
+      - name: Watchdog tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\Watchdog.Tests.ps1
+
       - name: Install PSScriptAnalyzer
         shell: pwsh
         run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck

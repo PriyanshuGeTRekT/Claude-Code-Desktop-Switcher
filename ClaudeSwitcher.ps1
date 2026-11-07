@@ -84,6 +84,22 @@
     to show, then exit. Downloads the release's checksum file, and the script only when
     the checksum differs.
 
+.PARAMETER KeepRunning
+    Keep the named account open: reopen it when a Claude update, a logoff or a restart
+    closed it. Closing it yourself leaves it closed. Creates the watchdog task.
+
+.PARAMETER StopKeeping
+    Stop keeping the named account open. Removes the watchdog task once no account is kept.
+
+.PARAMETER Watch
+    One pass of the watchdog, as the scheduled task runs it every two minutes.
+
+.PARAMETER InstallWatchdog
+    Create (or refresh) the per-user scheduled task that runs -Watch.
+
+.PARAMETER RemoveWatchdog
+    Delete that task. The kept-running choices stay in settings.json.
+
 .EXAMPLE
     .\ClaudeSwitcher.ps1
     .\ClaudeSwitcher.ps1 -Launch Work
@@ -119,7 +135,12 @@ param(
     [string]$Restart,
     [switch]$Version,
     [switch]$Update,
-    [switch]$CheckUpdate
+    [switch]$CheckUpdate,
+    [string]$KeepRunning,
+    [string]$StopKeeping,
+    [switch]$Watch,
+    [switch]$InstallWatchdog,
+    [switch]$RemoveWatchdog
 )
 
 $ErrorActionPreference = 'Stop'
@@ -784,7 +805,7 @@ function Get-LaunchArgLine {
 
 # Returns 'focused' when the profile was already open, 'started' otherwise.
 function Start-ClaudeProfile {
-    param([Parameter(Mandatory)][string]$Id)
+    param([Parameter(Mandatory)][string]$Id, [switch]$Minimized)
 
     $path = Get-ProfilePath -Id $Id
     $open = (Get-RunningProfileMap)[$path.TrimEnd('\')]
@@ -827,7 +848,9 @@ function Start-ClaudeProfile {
     # explicit show state Claude would inherit ours and start with an invisible window.
     # The process is kept so its window can be given the profile's taskbar identity.
     $argLine = Get-LaunchArgLine -Id $Id -Path $path
-    $script:LaunchedProcess = Invoke-WithProfileEnv -Id $Id { Start-Process -FilePath $script:ClaudeExe -ArgumentList $argLine -WindowStyle Normal -PassThru }
+    # Minimized is best effort: it goes in STARTUPINFO, which Electron may or may not honour.
+    $show = $(if ($Minimized) { 'Minimized' } else { 'Normal' })
+    $script:LaunchedProcess = Invoke-WithProfileEnv -Id $Id { Start-Process -FilePath $script:ClaudeExe -ArgumentList $argLine -WindowStyle $show -PassThru }
     return $(if ($open) { 'focused' } else { 'started' })
 }
 
@@ -1585,7 +1608,8 @@ function Remove-ClaudeProfile {
     Get-ChildItem -LiteralPath $script:IconDir -Filter '*.ico' -ErrorAction SilentlyContinue |
         Where-Object { $_.BaseName -match $stale } | Remove-Item -Force -ErrorAction SilentlyContinue
     Set-ProfileLabel -Id $Target.Id -Label $null
-    foreach ($setting in 'ChosenColors', 'ProfileEnv', 'ProfileArgs') { Set-ProfileMapEntry -Setting $setting -Id $Target.Id -Value $null }
+    foreach ($setting in 'ChosenColors', 'ProfileEnv', 'ProfileArgs', 'KeepRunning') { Set-ProfileMapEntry -Setting $setting -Id $Target.Id -Value $null }
+    try { Sync-Watchdog } catch { }
 }
 
 function Install-Switcher {
@@ -1609,6 +1633,179 @@ function Install-Switcher {
             }
         }
     }
+}
+
+# ----------------------------------------------------------------- watchdog --
+
+<#
+    When the Claude desktop app installs an update while idle, Windows closes every copy
+    of it, extra accounts included, and the app brings back only its own, Default. The
+    same happens at logoff and restart. A kept account (KeepRunning in settings.json) is
+    reopened by a per-user scheduled task that runs -Watch every two minutes and at logon.
+    It acts only when the account's own log ends in a forced close, never after a quit
+    by the user, and not while an update is still being applied.
+
+    Design and the log markers by mafarhan-avn (issue #9), who traced a night of outages
+    through the AppX and main.log entries.
+#>
+$script:WatchdogTaskName  = 'Claude Profile Switcher watchdog'
+$script:WatchdogLogPath   = Join-Path $script:SwitcherHome 'watchdog.log'
+$script:WatchdogStatePath = Join-Path $script:SwitcherHome 'watchdog-state.json'
+# Seen in main.log on Claude 3.16xx (Store build). The newest line that carries any of
+# them decides. A user's own quit logs the first two; nothing else matches them, in
+# particular not "beforeQuitForUpdate handler fired".
+$script:UserQuitMarkers    = @('beforeQuit: handler fired', 'willQuit: handler fired')
+$script:ForcedCloseMarkers = @('Windows session ending', 'going down for update', 'beforeQuitForUpdate', '[stealth-update]')
+
+function Write-WatchdogLog {
+    param([string]$Message)
+    try {
+        New-Item -ItemType Directory -Force -Path (Split-Path $script:WatchdogLogPath -Parent) | Out-Null
+        if ((Test-Path -LiteralPath $script:WatchdogLogPath) -and (Get-Item -LiteralPath $script:WatchdogLogPath).Length -gt 100KB) {
+            Remove-Item -LiteralPath $script:WatchdogLogPath -Force
+        }
+        Add-Content -LiteralPath $script:WatchdogLogPath -Value ('[{0}] {1}' -f (Get-Date -Format 's'), $Message)
+    } catch { }
+}
+
+# 'forced', 'user' or 'unknown', from the tail of an account's main.log, newest line
+# first. No recognisable line at all means leave the account alone.
+function Get-ClaudeExitKind {
+    param([string[]]$LogTail)
+    for ($i = $LogTail.Count - 1; $i -ge 0; $i--) {
+        $line = [string]$LogTail[$i]
+        foreach ($m in $script:UserQuitMarkers)    { if ($line.Contains($m)) { return 'user' } }
+        foreach ($m in $script:ForcedCloseMarkers) { if ($line.Contains($m)) { return 'forced' } }
+    }
+    return 'unknown'
+}
+
+function Get-ProfileLogTail {
+    param([Parameter(Mandatory)]$Target, [int]$Lines = 40)
+    $log = Join-Path (Get-ProfileDataPath -Target $Target) 'logs\main.log'
+    if (-not (Test-Path -LiteralPath $log)) { return @() }
+    return @(Get-Content -LiteralPath $log -Tail $Lines -ErrorAction SilentlyContinue)
+}
+
+function Get-KeptProfiles {
+    $kept = @{}
+    foreach ($e in (Get-ProfileMap -Setting 'KeepRunning').GetEnumerator()) { if ($e.Value -eq $true) { $kept[$e.Key] = $true } }
+    return $kept
+}
+
+function Get-WatchdogState {
+    $state = @{}
+    if (Test-Path -LiteralPath $script:WatchdogStatePath) {
+        try { (Get-Content -LiteralPath $script:WatchdogStatePath -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $state[$_.Name] = [string]$_.Value } } catch { }
+    }
+    return $state
+}
+
+function Set-WatchdogState {
+    param([hashtable]$State)
+    New-Item -ItemType Directory -Force -Path $script:SwitcherHome | Out-Null
+    ($State | ConvertTo-Json) | Set-Content -LiteralPath $script:WatchdogStatePath -Encoding UTF8
+}
+
+# Which kept accounts to reopen now: closed, by a forced close, and not reopened in the
+# last CooldownMinutes already. Pure, so the tests can feed it cases.
+function Select-WatchdogTargets {
+    param([object[]]$Profiles, [hashtable]$Kept, [hashtable]$ExitKinds, [hashtable]$LastReopened, [datetime]$Now, [int]$CooldownMinutes = 10)
+    $targets = @()
+    foreach ($p in @($Profiles)) {
+        if (-not $Kept[$p.Id]) { continue }
+        if ($p.Pid) { continue }
+        if ($ExitKinds[$p.Id] -ne 'forced') { continue }
+        if ($LastReopened.ContainsKey($p.Id)) {
+            try { if (([datetime]$LastReopened[$p.Id]) -gt $Now.AddMinutes(-$CooldownMinutes)) { continue } } catch { }
+        }
+        $targets += $p
+    }
+    return $targets
+}
+
+# The Store package mid-update (its status is not Ok), or an exe that appeared in the
+# last minute: the app is still settling and bringing Default back itself. Wait.
+function Test-ClaudeUpdating {
+    if ($script:ClaudeApp.Kind -eq 'Msix') {
+        $pkg = Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($pkg -and "$($pkg.Status)" -ne 'Ok') { return $true }
+    }
+    try { if ((Get-Item -LiteralPath $script:ClaudeExe).CreationTime -gt (Get-Date).AddSeconds(-60)) { return $true } } catch { }
+    return $false
+}
+
+# One pass. Returns the names reopened.
+function Invoke-Watchdog {
+    $kept = Get-KeptProfiles
+    if (-not $kept.Count) { return @() }
+    if (Test-ClaudeUpdating) { Write-WatchdogLog 'Claude is updating; waiting.'; return @() }
+    $profiles = @(Get-ProfileList)
+    $kinds = @{}
+    foreach ($p in $profiles) {
+        if ($kept[$p.Id] -and -not $p.Pid) { $kinds[$p.Id] = Get-ClaudeExitKind -LogTail (Get-ProfileLogTail -Target $p) }
+    }
+    $state   = Get-WatchdogState
+    $targets = @(Select-WatchdogTargets -Profiles $profiles -Kept $kept -ExitKinds $kinds -LastReopened $state -Now (Get-Date))
+    $done = @()
+    foreach ($p in $targets) {
+        try {
+            # Minimized, and never brought to the front: the PC may be in use.
+            Start-ProfileFromConsole -Target $p -Minimized | Out-Null
+            $state[$p.Id] = (Get-Date).ToString('o')
+            Set-WatchdogState -State $state
+            Write-WatchdogLog "Reopened '$($p.Name)': its log ended in a forced close."
+            $done += $p.Name
+            Start-Sleep -Seconds 3
+        } catch {
+            Write-WatchdogLog "Could not reopen '$($p.Name)': $($_.Exception.Message)"
+        }
+    }
+    return $done
+}
+
+# The task's command: a headless console, this script, -Watch, like the shortcuts.
+function Get-WatchdogCommand {
+    $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+    $cmd     = "-NoProfile -ExecutionPolicy Bypass -File `"$(Get-LauncherScript)`" -Watch"
+    if ([Environment]::OSVersion.Version.Build -ge 17763 -and (Test-Path -LiteralPath $conhost)) {
+        return @{ Execute = $conhost; Argument = "--headless `"$ps`" $cmd" }
+    }
+    return @{ Execute = $ps; Argument = "-WindowStyle Hidden $cmd" }
+}
+
+function Test-WatchdogInstalled {
+    if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) { return $false }
+    return [bool](Get-ScheduledTask -TaskName $script:WatchdogTaskName -ErrorAction SilentlyContinue)
+}
+
+# Per user, no admin rights: at logon and every two minutes, one copy at a time, on
+# battery too, and never longer than five minutes. -Force replaces an older definition.
+function Install-Watchdog {
+    if (-not (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue)) {
+        throw 'The ScheduledTasks module is missing, so the watchdog task cannot be created. It ships with Windows 8 and later.'
+    }
+    $cmd    = Get-WatchdogCommand
+    $action = New-ScheduledTaskAction -Execute $cmd.Execute -Argument $cmd.Argument
+    $user   = "$env:USERDOMAIN\$env:USERNAME"
+    # No -RepetitionDuration: left out, it repeats indefinitely. [TimeSpan]::MaxValue, the
+    # documented-looking alternative, is refused by Task Scheduler as out of range.
+    $every  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2)
+    $logon  = New-ScheduledTaskTrigger -AtLogOn -User $user
+    $logon.Repetition = $every.Repetition
+    $settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $script:WatchdogTaskName -Action $action -Trigger @($logon, $every) -Settings $settings -Principal $principal -Force | Out-Null
+}
+
+function Remove-Watchdog {
+    if (Test-WatchdogInstalled) { Unregister-ScheduledTask -TaskName $script:WatchdogTaskName -Confirm:$false }
+}
+
+# The task exists exactly while some account is kept running.
+function Sync-Watchdog {
+    if ((Get-KeptProfiles).Count) { Install-Watchdog } else { Remove-Watchdog }
 }
 
 # ------------------------------------------------------- Claude Code chats --
@@ -2342,6 +2539,8 @@ if ($Status) {
     "Handler backup:   $backup"
     "Pending sign-in:  $(if ($p = Get-PendingSignIn) { $p } else { 'none' })"
     "Other links:      $(if ($o = Get-OtherLinkTarget) { "open in '$($o.Name)'" } else { 'open in Default' })"
+    $keptNames = @((Get-ProfileList -SkipStatus | Where-Object { (Get-KeptProfiles)[$_.Id] }).Name)
+    "Kept running:     $(if ($keptNames.Count) { $keptNames -join ', ' } else { 'none' }); watchdog task $(if (Test-WatchdogInstalled) { 'installed' } else { 'not installed' })"
     "Router log:       $($script:RouterLogPath)"
     ''
     'Open accounts:'
@@ -2403,8 +2602,8 @@ function Resolve-ProfileOrThrow {
 # has to be set before the window is shown), and take the claude:// handler back if
 # routing is on. Returns what Start-ClaudeProfile did.
 function Start-ProfileFromConsole {
-    param([Parameter(Mandatory)]$Target)
-    $how = Start-ClaudeProfile -Id $Target.Id
+    param([Parameter(Mandatory)]$Target, [switch]$Minimized)
+    $how = Start-ClaudeProfile -Id $Target.Id -Minimized:$Minimized
     if ($how -eq 'started' -and -not $Target.IsDefault) {
         try {
             $watch = New-IdentityWatch -Target $Target -Process $script:LaunchedProcess
@@ -2431,6 +2630,40 @@ if ($Restart) {
     $was = Stop-ClaudeProfile -Id $target.Id
     Start-ProfileFromConsole -Target $target | Out-Null
     $(if ($was -eq 'closed') { "Restarted '$($target.Name)'." } else { "'$($target.Name)' was not open; opened it." })
+    return
+}
+
+if ($Watch) {
+    $reopened = @(Invoke-Watchdog)
+    if ($reopened.Count) { "Reopened: $($reopened -join ', ')" }
+    return
+}
+
+if ($KeepRunning) {
+    $target = Resolve-ProfileOrThrow -Name $KeepRunning
+    Set-ProfileMapEntry -Setting 'KeepRunning' -Id $target.Id -Value $true
+    Sync-Watchdog
+    "'$($target.Name)' is kept running: a Claude update, a logoff or a restart that closes it is undone within two minutes. Closing it yourself leaves it closed."
+    return
+}
+
+if ($StopKeeping) {
+    $target = Resolve-ProfileOrThrow -Name $StopKeeping
+    Set-ProfileMapEntry -Setting 'KeepRunning' -Id $target.Id -Value $null
+    Sync-Watchdog
+    "'$($target.Name)' is no longer kept running." + $(if (-not (Get-KeptProfiles).Count) { ' The watchdog task was removed.' } else { '' })
+    return
+}
+
+if ($InstallWatchdog) {
+    Install-Watchdog
+    "Created the task '$($script:WatchdogTaskName)'. It reopens the accounts marked with -KeepRunning."
+    return
+}
+
+if ($RemoveWatchdog) {
+    Remove-Watchdog
+    "Removed the task '$($script:WatchdogTaskName)'. Kept-running choices stay in settings.json for when it is created again."
     return
 }
 
@@ -2639,6 +2872,7 @@ function Update-List {
     if (-not $Force -and $sig -eq $script:ListSignature) { return }
     $script:ListSignature = $sig
 
+    $kept = Get-KeptProfiles
     $listView.BeginUpdate()
     $listView.Items.Clear()
     foreach ($p in $profiles) {
@@ -2662,6 +2896,7 @@ function Update-List {
         $item.SubItems[2].ForeColor = $muted
         $note = $(if ($p.IsDefault) { 'your original' }
                   elseif ($p.Id -eq $script:JustAdded -and $p.Name -eq $p.Id) { 'new - F2 to rename' }
+                  elseif ($kept[$p.Id]) { 'kept running' }
                   elseif ($p.Name -ne $p.Id) { "folder: $($p.Id)" }
                   else { '' })
         $item.SubItems.Add($note) | Out-Null
@@ -2915,7 +3150,7 @@ function Show-EditDialog {
     $storeDefault = ($Target.IsDefault -and $script:ClaudeApp.Kind -eq 'Msix')
     $dlg                 = New-Object System.Windows.Forms.Form
     $dlg.Text            = "Edit '$($Target.Name)'"
-    $dlg.Size            = New-Object System.Drawing.Size(480, 468)
+    $dlg.Size            = New-Object System.Drawing.Size(480, 500)
     $dlg.StartPosition   = 'CenterParent'
     $dlg.FormBorderStyle = 'FixedDialog'
     $dlg.MaximizeBox     = $false
@@ -2987,15 +3222,23 @@ function Show-EditDialog {
     Add-Label $(if ($storeDefault) { 'Your original account starts through the Store, which takes no variables or flags.' }
                 else { 'Variables and flags reach Claude the next time this account starts.' }) 330 -Small
 
+    $keep          = New-Object System.Windows.Forms.CheckBox
+    $keep.Text     = 'Keep running: reopen it if a Claude update, a logoff or a restart closes it'
+    $keep.Location = New-Object System.Drawing.Point(18, 356)
+    $keep.Size     = New-Object System.Drawing.Size(440, 22)
+    $keep.Checked  = [bool](Get-KeptProfiles)[$Target.Id]
+    $dlg.Controls.Add($keep)
+    Add-Label 'A scheduled task looks every two minutes. Closing it yourself leaves it closed.' 378 -Small
+
     $ok              = New-Object System.Windows.Forms.Button
     $ok.Text         = 'Save'
-    $ok.Location     = New-Object System.Drawing.Point(262, 376)
+    $ok.Location     = New-Object System.Drawing.Point(262, 410)
     $ok.Size         = New-Object System.Drawing.Size(90, 32)
     $ok.DialogResult = 'OK'
     $dlg.Controls.Add($ok)
     $cancel              = New-Object System.Windows.Forms.Button
     $cancel.Text         = 'Cancel'
-    $cancel.Location     = New-Object System.Drawing.Point(358, 376)
+    $cancel.Location     = New-Object System.Drawing.Point(358, 410)
     $cancel.Size         = New-Object System.Drawing.Size(90, 32)
     $cancel.DialogResult = 'Cancel'
     $dlg.Controls.Add($cancel)
@@ -3003,7 +3246,7 @@ function Show-EditDialog {
     $dlg.CancelButton = $cancel
 
     if ($dlg.ShowDialog($form) -ne 'OK') { return $null }
-    return [pscustomobject]@{ Name = $name.Text.Trim(); ColorIndex = $script:EditColor; EnvText = $envBox.Text; Flags = $flags.Text.Trim() }
+    return [pscustomobject]@{ Name = $name.Text.Trim(); ColorIndex = $script:EditColor; EnvText = $envBox.Text; Flags = $flags.Text.Trim(); KeepRunning = $keep.Checked }
 }
 
 function Invoke-EditProfile {
@@ -3031,6 +3274,10 @@ function Invoke-EditProfile {
             Set-ProfileMapEntry -Setting 'ProfileEnv'  -Id $p.Id -Value $(if ($parsed.Vars.Count) { $parsed.Vars } else { $null })
             Set-ProfileMapEntry -Setting 'ProfileArgs' -Id $p.Id -Value $(if ($entered.Flags) { $entered.Flags } else { $null })
             $launchChanged = ((ConvertTo-EnvLines -Vars $parsed.Vars) -ne $oldEnv) -or ($entered.Flags -ne $oldArgs)
+        }
+        if ($entered.KeepRunning -ne [bool](Get-KeptProfiles)[$p.Id]) {
+            Set-ProfileMapEntry -Setting 'KeepRunning' -Id $p.Id -Value $(if ($entered.KeepRunning) { $true } else { $null })
+            try { Sync-Watchdog } catch { Show-Message "The choice is saved, but the watchdog task could not be changed: $($_.Exception.Message)" 'Keep running' 'OK' 'Warning' | Out-Null }
         }
         $current = $p
         if (-not $p.IsDefault -and $entered.ColorIndex -ge 0 -and $entered.ColorIndex -ne (Get-ProfileColorIndex -Id $p.Id)) {
