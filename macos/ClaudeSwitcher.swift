@@ -932,8 +932,23 @@ enum Router {
     static func setHandler(_ app: URL) throws {
         guard let id = Bundle(url: app)?.bundleIdentifier else { throw SwitcherError("\(app.path) is not an app.") }
         _ = LSRegisterURL(app as CFURL, true)
-        let status = LSSetDefaultHandlerForURLScheme(scheme as CFString, id as CFString)
-        if status != noErr { throw SwitcherError("macOS would not make \(app.lastPathComponent) the claude:// handler (status \(status)).") }
+        // By location first, so a second copy with the same bundle id cannot be picked
+        // instead. Never call this on the main thread: the answer may come back there.
+        let sem = DispatchSemaphore(value: 0)
+        var failure: Error?
+        NSWorkspace.shared.setDefaultApplication(at: app, toOpenURLsWithScheme: scheme) { e in failure = e; sem.signal() }
+        if sem.wait(timeout: .now() + 10) == .timedOut || failure != nil {
+            let status = LSSetDefaultHandlerForURLScheme(scheme as CFString, id as CFString)
+            if status != noErr {
+                throw SwitcherError("macOS would not make \(app.lastPathComponent) the claude:// handler (\(failure?.localizedDescription ?? "status \(status)")).")
+            }
+        }
+        // Launch Services can take a moment to report the new choice.
+        for _ in 0..<20 {
+            if let u = handlerURL(), Bundle(url: u)?.bundleIdentifier == id { return }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        throw SwitcherError("macOS kept \(handlerName()) as the claude:// handler.")
     }
 
     static func enable() throws {
@@ -1747,13 +1762,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func menuAdd() { accounts.addAccount() }
     @objc func menuShow() { accounts.show() }
     @objc func menuRoute() {
-        do {
-            if Router.isOn() { try Router.disable() } else { try Router.enable() }
-        } catch {
-            let a = NSAlert()
-            a.messageText = "Could not change sign-in routing"
-            a.informativeText = error.localizedDescription
-            a.runModal()
+        let on = Router.isOn()
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                if on { try Router.disable() } else { try Router.enable() }
+            } catch {
+                DispatchQueue.main.async {
+                    let a = NSAlert()
+                    a.messageText = "Could not change sign-in routing"
+                    a.informativeText = error.localizedDescription
+                    a.runModal()
+                }
+            }
         }
     }
 

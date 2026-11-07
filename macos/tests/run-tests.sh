@@ -218,6 +218,7 @@ else
     check "a malformed link is refused" '! grep -q "code=five" "$log" && grep -q "Refused" "$P/.switcher/router.log"'
     echo "  --- router log"; sed "s/^/      /" "$P/.switcher/router.log"
     out="$(sw --revert)"
+    echo "$out" | sed "s/^/      /"
     check "--revert gives links back to Claude" 'echo "$out" | grep -q "links open in: Claude$" && sw --status | grep -q "routing:  off"'
     sw --handle-link "claude://claude.ai/sso-callback?code=six" >/dev/null
     check "with routing off, a sign-in goes to Default" 'reached "code=six" Default'
