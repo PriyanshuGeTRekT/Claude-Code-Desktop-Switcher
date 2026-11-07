@@ -8,6 +8,8 @@
 // One file, AppKit only, no dependencies. Build with macos/build.sh.
 
 import AppKit
+import CoreServices
+import CryptoKit
 import Foundation
 
 let switcherVersion = "2.3.0"
@@ -268,12 +270,12 @@ enum Launcher {
     /// a closed Terminal, and each account gets its own Dock icon. Always -n: without it,
     /// Launch Services only brings forward whichever copy of Claude is already running,
     /// which may be another account. Only an account found not running is started.
-    static func openArguments(app: URL, profile: Profile, background: Bool = false) -> [String] {
+    static func openArguments(app: URL, profile: Profile, background: Bool = false, trailing: [String] = []) -> [String] {
         var a = ["-n", "-a", app.path]
         if background { a.insert("-g", at: 0) }   // -g: start it without bringing it to the front
         for (k, v) in env(profile.id) { a += ["--env", "\(k)=\(v)"] }
         var pass = profile.isDefault ? [] : ["--user-data-dir=\(profile.dataDir.path)"]
-        pass += extraArgs(profile.id)
+        pass += extraArgs(profile.id) + trailing
         if !pass.isEmpty { a += ["--args"] + pass }
         return a
     }
@@ -288,7 +290,9 @@ enum Launcher {
         let app = try ClaudeApp.require()
         if !profile.isDefault {
             try FileManager.default.createDirectory(at: profile.dataDir, withIntermediateDirectories: true)
+            if !background, Router.isOn(), Router.signedIn(profile.dataDir) != true { Router.setPending(profile.id) }
         }
+        if Router.isOn() { Router.holdHandler() }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         p.arguments = openArguments(app: app, profile: profile, background: background)
@@ -678,6 +682,8 @@ enum Maintenance {
         out.append("Accounts folder: \(Loc.profileRoot.path)")
         out.append("Watchdog agent: \(Agents.isInstalled(Agents.watchdogLabel) ? (Agents.isLoaded(Agents.watchdogLabel) ? "installed, loaded" : "installed, not loaded") : "not installed")")
         out.append("Open at Login: \(Agents.isInstalled(Agents.loginLabel) ? "on" : "off")")
+        out.append(Router.statusText())
+        out.append("Update check: \((Settings.load()["UpdateCheck"] as? Bool) == false ? "off" : "daily")")
         out.append("")
         out.append("Accounts:")
         let kept = Watchdog.kept()
@@ -702,6 +708,10 @@ enum Maintenance {
         // Nothing is kept running after this, so deleting accounts below cannot bring the
         // watchdog back.
         if !Watchdog.kept().isEmpty { try? Settings.set("KeepRunning", nil); done.append("stopped keeping accounts running") }
+        if Router.isOn() || Router.isOurs() {
+            do { let note = try Router.disable(); done.append(note.map { "turned sign-in routing off. \($0)" } ?? "gave claude:// links back to Claude") }
+            catch { done.append("could not give claude:// links back to Claude: \(error.localizedDescription)") }
+        }
         for label in [Agents.watchdogLabel, Agents.loginLabel] where Agents.isInstalled(label) {
             Agents.remove(label)
             done.append("removed the launch agent \(label)")
@@ -724,6 +734,411 @@ enum Maintenance {
         }
         done.append("to finish, quit the switcher from the menu bar and drag it from Applications to the Bin")
         return done
+    }
+}
+
+// MARK: - Small process helper
+
+@discardableResult
+func runTool(_ path: String, _ args: [String]) throws -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = out
+    try p.run()
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    let text = String(decoding: data, as: UTF8.self)
+    if p.terminationStatus != 0 {
+        throw SwitcherError("\(URL(fileURLWithPath: path).lastPathComponent) failed: \(text.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+    return text
+}
+
+func appendLine(_ url: URL, _ message: String) {
+    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int), size > 100_000 {
+        try? FileManager.default.removeItem(at: url)
+    }
+    let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+    if let h = FileHandle(forWritingAtPath: url.path) { h.seekToEndOfFile(); h.write(Data(line.utf8)); h.closeFile() }
+    else { try? Data(line.utf8).write(to: url) }
+}
+
+// MARK: - Sign-in links
+
+/*
+    A browser finishes a sign-in by opening a claude:// link. macOS hands it to one running
+    copy of Claude, whichever it likes, so with several accounts open the sign-in often
+    lands in the wrong one. With routing on, the switcher is the claude:// handler instead:
+    it works out which account is waiting and hands the link to that copy of Claude
+    directly, as an Apple Event addressed to its process. Same rules as on Windows: the
+    account just started while signed out, else the only open account that is signed
+    out, else the one whose window was used last, else Default. Other links go to the
+    account "Open Other Links In" names, or Default. Links are never written to a log,
+    because a sign-in link carries a one-time code.
+*/
+enum Router {
+    static let scheme = "claude"
+    static var pendingURL: URL { Watchdog.home.appendingPathComponent("pending-sign-in.json") }
+    static var logURL: URL { Watchdog.home.appendingPathComponent("router.log") }
+
+    static func isOn() -> Bool { (Settings.load()["SignInRouting"] as? Bool) == true }
+    static func log(_ message: String) { appendLine(logURL, message) }
+
+    /// claude:// and only characters RFC 3986 allows in a URI: no spaces, quotes or control
+    /// characters. \z, not $, so a trailing newline does not slip through.
+    static func isSafe(_ link: String) -> Bool {
+        link.count <= 2048 &&
+            link.range(of: "^claude://[A-Za-z0-9._~:/?#\\[\\]@!$&'()*+,;=%-]*\\z", options: .regularExpression) != nil
+    }
+
+    /// claude://login/... on older builds, claude://claude.ai/sso-callback?... on current ones.
+    static func isSignIn(_ link: String) -> Bool {
+        link.range(of: "^claude://(login/|claude\\.ai/sso-callback([/?#]|\\z))", options: .regularExpression) != nil
+    }
+
+    /// From the account's config.json, as on Windows: only which keys exist and how long a
+    /// value is, never the token. nil when there is nothing to read yet.
+    static func signedIn(_ dir: URL) -> Bool? {
+        guard let data = try? Data(contentsOf: dir.appendingPathComponent("config.json")),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        if let v = obj["windowSizeWasSignedIn"] { return (v as? Bool) ?? false }
+        if let v = obj["oauth:tokenCacheV2"] { return "\(v)".count > 100 }
+        return false
+    }
+
+    static func setPending(_ id: String, minutes: Double = 15) {
+        try? FileManager.default.createDirectory(at: Watchdog.home, withIntermediateDirectories: true)
+        let d: [String: Any] = ["Profile": id, "Expires": Date().addingTimeInterval(minutes * 60).timeIntervalSince1970]
+        if let data = try? JSONSerialization.data(withJSONObject: d) { try? data.write(to: pendingURL) }
+    }
+
+    static func clearPending() { try? FileManager.default.removeItem(at: pendingURL) }
+
+    static func pending() -> String? {
+        guard let data = try? Data(contentsOf: pendingURL) else { return nil }
+        guard let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = d["Profile"] as? String, let expires = d["Expires"] as? Double,
+              expires > Date().timeIntervalSince1970 else { clearPending(); return nil }
+        return id
+    }
+
+    static func select(_ profiles: [Profile], signedIn: [String: Bool], pending: String?, frontmost: pid_t?) -> (Profile, String)? {
+        if let id = pending, let hit = profiles.first(where: { $0.id == id && !$0.isDefault }) { return (hit, "launched while signed out") }
+        let open = profiles.filter { $0.pid != nil && !$0.isDefault }
+        let out = open.filter { signedIn[$0.id] == false }
+        if out.count == 1 { return (out[0], "the only open account that is signed out") }
+        if let f = frontmost, let hit = open.first(where: { $0.pid == f }) { return (hit, "its window was used most recently") }
+        return nil
+    }
+
+    /// Windows come front to back, so the first ordinary one owned by these processes is
+    /// the one used last. Only owner process ids are read, which needs no permission.
+    static func frontmost(among pids: [pid_t]) -> pid_t? {
+        guard !pids.isEmpty,
+              let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return nil }
+        for w in info {
+            guard (w[kCGWindowLayer as String] as? Int) == 0, let pid = (w[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value else { continue }
+            if pids.contains(pid) { return pid }
+        }
+        return nil
+    }
+
+    static func otherLinkTarget() -> Profile? {
+        guard let id = Settings.load()["OpenLinksIn"] as? String, id != defaultID,
+              let p = Profiles.resolve(id), !p.isDefault else { return nil }
+        return p
+    }
+
+    /// The same event a browser's link sends, addressed to one process. macOS asks once
+    /// whether the switcher may send it ("control Claude").
+    static func sendGetURL(_ link: String, to pid: pid_t) -> OSStatus {
+        let target = NSAppleEventDescriptor(processIdentifier: pid)
+        let ask = (ProcessInfo.processInfo.environment["CLAUDE_SWITCHER_NO_PROMPT"] ?? "").isEmpty
+        if let desc = target.aeDesc {
+            let allowed = AEDeterminePermissionToAutomateTarget(desc, AEEventClass(kInternetEventClass), AEEventID(kAEGetURL), ask)
+            if allowed != noErr { return allowed }
+        }
+        let event = NSAppleEventDescriptor.appleEvent(withEventClass: AEEventClass(kInternetEventClass), eventID: AEEventID(kAEGetURL),
+                                                      targetDescriptor: target, returnID: AEReturnID(kAutoGenerateReturnID),
+                                                      transactionID: AETransactionID(kAnyTransactionID))
+        event.setParam(NSAppleEventDescriptor(string: link), forKeyword: AEKeyword(keyDirectObject))
+        do { _ = try event.sendEvent(options: [.noReply], timeout: 10) } catch { return OSStatus((error as NSError).code) }
+        return noErr
+    }
+
+    /// Starts the account when it is closed, then hands it the link. Returns how.
+    @discardableResult
+    static func deliver(_ link: String, to target: Profile) throws -> String {
+        var p = target
+        if p.pid == nil {
+            try Launcher.start(p)
+            for _ in 0..<60 {
+                Thread.sleep(forTimeInterval: 0.5)
+                if let fresh = Profiles.resolve(p.id), fresh.pid != nil { p = fresh; break }
+            }
+            Thread.sleep(forTimeInterval: 1)
+        }
+        guard let pid = p.pid else { throw SwitcherError("'\(p.name)' did not start.") }
+        let status = sendGetURL(link, to: pid)
+        if status == noErr { return "as an Apple Event" }
+        // Not allowed to send it (or it failed): start the account's Claude with the link as
+        // an argument, which Electron passes to the copy already using that folder.
+        let app = try ClaudeApp.require()
+        try runTool("/usr/bin/open", Launcher.openArguments(app: app, profile: p, trailing: [link]))
+        return "as an argument (Apple Event status \(status))"
+    }
+
+    static func handle(_ link: String) {
+        guard isSafe(link) else { log("Refused a claude:// link that failed validation."); return }
+        func toDefault(_ note: String) {
+            guard let d = Profiles.resolve(defaultID) else { return }
+            do { let how = try deliver(link, to: d); log("\(note) (\(how))") }
+            catch { log("Could not pass a link to Default: \(error.localizedDescription)") }
+        }
+        if !isOn() { toDefault("Routing is off; passed a link to Default."); return }
+        defer { retake() }
+        if !isSignIn(link) {
+            guard let other = otherLinkTarget() else { toDefault("Not a sign-in link; passed to Default."); return }
+            do { let how = try deliver(link, to: other); log("Not a sign-in link; opened in '\(other.name)' (Open Other Links In, \(how)).") }
+            catch { toDefault("Could not open a link in '\(other.name)': \(error.localizedDescription). Passed to Default.") }
+            return
+        }
+        let profiles = Profiles.list()
+        var signed: [String: Bool] = [:]
+        for p in profiles where p.pid != nil && !p.isDefault { if let v = signedIn(p.dataDir) { signed[p.id] = v } }
+        let pick = select(profiles, signedIn: signed, pending: pending(), frontmost: frontmost(among: profiles.compactMap { $0.pid }))
+        // Cleared after the hand-over: starting a closed account notes it as pending again.
+        defer { clearPending() }
+        guard let picked = pick else { toDefault("Sign-in sent to Default (no other account was waiting for one)."); return }
+        let (target, reason) = picked
+        do { let how = try deliver(link, to: target); log("Sign-in sent to '\(target.name)' (\(reason), \(how)).") }
+        catch { toDefault("Routing failed: \(error.localizedDescription). Sign-in passed to Default.") }
+    }
+
+    // The handler itself.
+    static func handlerURL() -> URL? { NSWorkspace.shared.urlForApplication(toOpen: URL(string: "claude://")!) }
+    static func handlerName() -> String {
+        guard let u = handlerURL() else { return "nothing" }
+        return (Bundle(url: u)?.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? u.deletingPathExtension().lastPathComponent
+    }
+    static func isOurs() -> Bool {
+        guard let u = handlerURL() else { return false }
+        return Bundle(url: u)?.bundleIdentifier == Bundle.main.bundleIdentifier
+    }
+
+    static func setHandler(_ app: URL) throws {
+        guard let id = Bundle(url: app)?.bundleIdentifier else { throw SwitcherError("\(app.path) is not an app.") }
+        _ = LSRegisterURL(app as CFURL, true)
+        // By location first, so a second copy with the same bundle id cannot be picked
+        // instead. Never call this on the main thread: the answer may come back there.
+        let sem = DispatchSemaphore(value: 0)
+        var failure: Error?
+        NSWorkspace.shared.setDefaultApplication(at: app, toOpenURLsWithScheme: scheme) { e in failure = e; sem.signal() }
+        if sem.wait(timeout: .now() + 10) == .timedOut || failure != nil {
+            let status = LSSetDefaultHandlerForURLScheme(scheme as CFString, id as CFString)
+            if status != noErr {
+                throw SwitcherError("macOS would not make \(app.lastPathComponent) the claude:// handler (\(failure?.localizedDescription ?? "status \(status)")).")
+            }
+        }
+        // Launch Services can take a moment to report the new choice.
+        for _ in 0..<20 {
+            if let u = handlerURL(), Bundle(url: u)?.bundleIdentifier == id { return }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        throw SwitcherError("macOS kept \(handlerName()) as the claude:// handler" + (failure.map { " (\($0.localizedDescription))" } ?? "") + ".")
+    }
+
+    static func enable() throws {
+        let me = Bundle.main.bundleURL
+        guard me.pathExtension == "app" else { throw SwitcherError("Run this from Claude Profile Switcher.app: macOS hands links to apps, not to a loose program.") }
+        try Settings.set("SignInRouting", true)
+        try setHandler(me)
+    }
+
+    /// Returns a note when macOS kept the switcher as the handler (it can ask the user
+    /// first). Nothing is lost: with routing off every link goes on to Default, and Claude
+    /// makes itself the handler again the next time it starts.
+    @discardableResult
+    static func disable() throws -> String? {
+        try Settings.set("SignInRouting", nil)
+        clearPending()
+        guard isOurs(), let claude = ClaudeApp.find() else { return nil }
+        do { try setHandler(claude) } catch {
+            return "\(error.localizedDescription) Until Claude next starts and takes them back, the switcher passes every link to Default."
+        }
+        return nil
+    }
+
+    /// Claude makes itself the handler again as it starts; take it back.
+    static func retake() {
+        guard isOn(), !isOurs(), Bundle.main.bundleURL.pathExtension == "app" else { return }
+        do { try setHandler(Bundle.main.bundleURL); log("Took back the claude:// handler.") }
+        catch { log("Could not take back the claude:// handler: \(error.localizedDescription)") }
+    }
+
+    /// Claude makes itself the handler as it starts, and a sign-in can follow within
+    /// seconds, so after a launch the handler is watched closely for 20 s: on a background
+    /// thread in the menu bar app, or by a short-lived copy of the switcher otherwise.
+    static func holdHandler(seconds: Double = 20) {
+        if runningAsMenuBarApp {
+            DispatchQueue.global(qos: .utility).async { holdLoop(seconds) }
+            return
+        }
+        guard Bundle.main.bundleURL.pathExtension == "app", let exe = Bundle.main.executablePath else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = ["--hold-handler"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+    }
+
+    static func holdLoop(_ seconds: Double) {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end {
+            retake()
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+    }
+
+    static func statusText() -> String {
+        var out = ["Sign-in routing:  \(isOn() ? "on" : "off")",
+                   "claude:// links open in: \(handlerName())",
+                   "Other links:      open in '\(otherLinkTarget()?.name ?? defaultID)'"]
+        if let id = pending(), let p = Profiles.resolve(id, status: false) { out.append("Waiting for:      '\(p.name)' to sign in") }
+        return out.joined(separator: "\n")
+    }
+}
+
+// MARK: - Updates
+
+/*
+    Releases publish ClaudeProfileSwitcher-macOS.zip next to SHA256SUMS.txt. A check asks
+    GitHub where "latest release" points, which reveals its version and nothing else. An
+    update downloads the zip, installs it only when it matches the published checksum,
+    holds this app (same bundle id), is newer and passes codesign --verify, and swaps it
+    in place of this copy. Nothing is fetched once "UpdateCheck": false is in settings.json,
+    except when asked for with --update or the menu.
+*/
+enum Updater {
+    static let repo = "PriyanshuGeTRekT/Claude-Code-Desktop-Switcher"
+    static let asset = "ClaudeProfileSwitcher-macOS.zip"
+    static var logURL: URL { Watchdog.home.appendingPathComponent("update.log") }
+    /// A folder standing in for the release, for the tests.
+    static var localFeed: URL? {
+        guard let d = ProcessInfo.processInfo.environment["CLAUDE_SWITCHER_RELEASE_DIR"], !d.isEmpty else { return nil }
+        return URL(fileURLWithPath: d, isDirectory: true)
+    }
+
+    static func compare(_ a: String, _ b: String) -> Int {
+        func parts(_ v: String) -> [Int] {
+            let head = v.prefix { $0.isNumber || $0 == "." }
+            return head.split(separator: ".").map { Int($0) ?? 0 }
+        }
+        let pa = parts(a), pb = parts(b)
+        for i in 0..<max(pa.count, pb.count) {
+            let x = i < pa.count ? pa[i] : 0, y = i < pb.count ? pb[i] : 0
+            if x != y { return x < y ? -1 : 1 }
+        }
+        return 0
+    }
+
+    static func publishedHash(_ sums: String, file: String) -> String? {
+        for line in sums.components(separatedBy: .newlines) {
+            let parts = line.trimmingCharacters(in: .whitespaces).split(separator: " ", maxSplits: 1).map(String.init)
+            guard parts.count == 2, parts[0].count == 64, parts[0].allSatisfy({ $0.isHexDigit }) else { continue }
+            var name = parts[1].trimmingCharacters(in: .whitespaces)
+            if name.hasPrefix("*") { name.removeFirst() }
+            if name == file { return parts[0].lowercased() }
+        }
+        return nil
+    }
+
+    static func sha256(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+
+    static func fetch(_ request: URLRequest) throws -> (Data, URL) {
+        var req = request
+        req.setValue("ClaudeProfileSwitcher/\(switcherVersion) (macOS)", forHTTPHeaderField: "User-Agent")
+        let sem = DispatchSemaphore(value: 0)
+        var got: (Data?, URLResponse?, Error?) = (nil, nil, nil)
+        URLSession.shared.dataTask(with: req) { d, r, e in got = (d, r, e); sem.signal() }.resume()
+        sem.wait()
+        if let e = got.2 { throw e }
+        guard let http = got.1 as? HTTPURLResponse, http.statusCode == 200 else {
+            throw SwitcherError("GitHub answered \((got.1 as? HTTPURLResponse)?.statusCode ?? 0) for \(req.url?.absoluteString ?? "").")
+        }
+        return (got.0 ?? Data(), http.url ?? req.url!)
+    }
+
+    static func latestVersion() throws -> String {
+        if let dir = localFeed {
+            return try String(contentsOf: dir.appendingPathComponent("latest-version"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        var req = URLRequest(url: URL(string: "https://github.com/\(repo)/releases/latest")!, timeoutInterval: 30)
+        req.httpMethod = "HEAD"
+        let (_, final) = try fetch(req)
+        let tag = final.lastPathComponent
+        guard final.path.contains("/releases/tag/"), tag.hasPrefix("v") else { throw SwitcherError("Could not tell the latest version from \(final.absoluteString).") }
+        return String(tag.dropFirst())
+    }
+
+    static func download(_ name: String) throws -> Data {
+        if let dir = localFeed { return try Data(contentsOf: dir.appendingPathComponent(name)) }
+        return try fetch(URLRequest(url: URL(string: "https://github.com/\(repo)/releases/latest/download/\(name)")!, timeoutInterval: 180)).0
+    }
+
+    /// The newer version, or nil when this one is current.
+    static func check() throws -> String? {
+        try? Settings.set("LastUpdateCheck", ISO8601DateFormatter().string(from: Date()))
+        let v = try latestVersion()
+        return compare(v, switcherVersion) > 0 ? v : nil
+    }
+
+    static func isDue() -> Bool {
+        if (Settings.load()["UpdateCheck"] as? Bool) == false { return false }
+        guard let s = Settings.load()["LastUpdateCheck"] as? String, let last = ISO8601DateFormatter().date(from: s) else { return true }
+        return Date().timeIntervalSince(last) > 24 * 3600
+    }
+
+    /// Replaces this copy of the app. Returns the version installed, or nil when current.
+    static func install() throws -> String? {
+        let bundle = Bundle.main.bundleURL
+        guard bundle.pathExtension == "app" else { throw SwitcherError("Run this from Claude Profile Switcher.app; a loose copy of the program cannot replace itself.") }
+        guard try check() != nil else { return nil }
+        let sums = String(decoding: try download("SHA256SUMS.txt"), as: UTF8.self)
+        guard let expected = publishedHash(sums, file: asset) else { throw SwitcherError("The release has no checksum for \(asset), so nothing was changed.") }
+        let zip = try download(asset)
+        guard sha256(zip) == expected else { throw SwitcherError("The download does not match the published checksum, so nothing was changed.") }
+        let work = try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: bundle, create: true)
+        defer { try? FileManager.default.removeItem(at: work) }
+        let zipURL = work.appendingPathComponent(asset)
+        try zip.write(to: zipURL)
+        let out = work.appendingPathComponent("unzipped", isDirectory: true)
+        try runTool("/usr/bin/ditto", ["-x", "-k", zipURL.path, out.path])
+        guard let newApp = try FileManager.default.contentsOfDirectory(at: out, includingPropertiesForKeys: nil).first(where: { $0.pathExtension == "app" }),
+              let info = NSDictionary(contentsOf: newApp.appendingPathComponent("Contents/Info.plist")),
+              info["CFBundleIdentifier"] as? String == Bundle.main.bundleIdentifier,
+              let version = info["CFBundleShortVersionString"] as? String else {
+            throw SwitcherError("The download does not hold Claude Profile Switcher, so nothing was changed.")
+        }
+        guard compare(version, switcherVersion) > 0 else { throw SwitcherError("The download is version \(version), not newer than \(switcherVersion). Nothing was changed.") }
+        try runTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", newApp.path])
+        _ = try FileManager.default.replaceItemAt(bundle, withItemAt: newApp)
+        appendLine(logURL, "Updated from \(switcherVersion) to \(version).")
+        return version
+    }
+
+    /// Opens the updated copy once this one has quit.
+    static func relaunch() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "sleep 1; /usr/bin/open \"$0\"", Bundle.main.bundleURL.path]
+        try? p.run()
+        NSApp.terminate(nil)
     }
 }
 
@@ -1257,6 +1672,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static let showNotification = Notification.Name("io.github.priyanshugetrekt.claude-switcher.show")
     private var statusItem: NSStatusItem!
     private var accounts: AccountsWindow!
+    private var upkeep: Timer?
+    private var availableUpdate: String?
+    private var updating = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -1274,7 +1692,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DistributedNotificationCenter.default().addObserver(forName: AppDelegate.showNotification, object: nil, queue: .main) { [weak self] _ in
             self?.accounts.show()
         }
-        accounts.show()
+        // Started to open a link, or at login: stay in the menu bar.
+        let plainLaunch = (notification.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool) ?? true
+        if plainLaunch && !startInBackground { accounts.show() }
+        // Every 5 s: take the claude:// handler back if Claude took it as it started (a
+        // launch from here also watches closely for 20 s), and once a day look for a newer
+        // switcher.
+        upkeep = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            DispatchQueue.global(qos: .utility).async {
+                Router.retake()
+                guard Updater.isDue() else { return }
+                let newer = try? Updater.check()
+                DispatchQueue.main.async { self?.availableUpdate = newer }
+            }
+        }
+        upkeep?.fire()
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls where url.scheme?.lowercased() == Router.scheme {
+            let link = url.absoluteString
+            DispatchQueue.global(qos: .userInitiated).async { Router.handle(link) }
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -1320,7 +1759,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         login.target = self
         login.state = Agents.isInstalled(Agents.loginLabel) ? .on : .off
         menu.addItem(login)
+        let route = NSMenuItem(title: "Send Sign-ins to the Right Account", action: #selector(menuRoute), keyEquivalent: "")
+        route.target = self
+        route.state = Router.isOn() ? .on : .off
+        route.toolTip = "Makes the switcher the claude:// handler, so a browser sign-in reaches the account that asked for it."
+        menu.addItem(route)
+        if Router.isOn() {
+            let other = NSMenuItem(title: "Open Other Links In", action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            let current = Router.otherLinkTarget()?.id ?? defaultID
+            for p in profiles {
+                let item = NSMenuItem(title: p.name, action: #selector(menuOtherLinks(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = p.id
+                item.state = p.id == current ? .on : .off
+                sub.addItem(item)
+            }
+            other.submenu = sub
+            menu.addItem(other)
+        }
         menu.addItem(.separator())
+        if let v = availableUpdate {
+            let up = NSMenuItem(title: "Update to \(v)", action: #selector(menuUpdate), keyEquivalent: "")
+            up.target = self
+            menu.insertItem(up, at: 0)
+            menu.insertItem(.separator(), at: 1)
+        }
+        let check = NSMenuItem(title: updating ? "Updating..." : "Check for Updates...", action: updating ? nil : #selector(menuUpdate), keyEquivalent: "")
+        check.target = self
+        menu.addItem(check)
         let quitApp = NSMenuItem(title: "Quit Claude Profile Switcher", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quitApp)
     }
@@ -1329,9 +1796,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func menuQuit(_ sender: NSMenuItem) { accounts.quitProfile(sender) }
     @objc func menuAdd() { accounts.addAccount() }
     @objc func menuShow() { accounts.show() }
+    @objc func menuRoute() {
+        let on = Router.isOn()
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                if on { try Router.disable() } else { try Router.enable() }
+            } catch {
+                DispatchQueue.main.async {
+                    let a = NSAlert()
+                    a.messageText = "Could not change sign-in routing"
+                    a.informativeText = error.localizedDescription
+                    a.runModal()
+                }
+            }
+        }
+    }
+
+    @objc func menuOtherLinks(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        try? Settings.set("OpenLinksIn", id == defaultID ? nil : id)
+    }
+
+    @objc func menuUpdate() {
+        updating = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result { try Updater.install() }
+            DispatchQueue.main.async {
+                self.updating = false
+                let a = NSAlert()
+                switch result {
+                case .success(let v?):
+                    self.availableUpdate = nil
+                    a.messageText = "Updated to \(v)"
+                    a.informativeText = "The switcher restarts to finish. Your accounts are not touched."
+                    a.runModal()
+                    Updater.relaunch()
+                case .success(nil):
+                    self.availableUpdate = nil
+                    a.messageText = "You have the latest version"
+                    a.informativeText = "Claude Profile Switcher \(switcherVersion) is the newest release."
+                    a.runModal()
+                case .failure(let e):
+                    a.messageText = "Could not update"
+                    a.informativeText = e.localizedDescription + "\n\nThe releases page has every version."
+                    a.addButton(withTitle: "Open Releases")
+                    a.addButton(withTitle: "Close")
+                    if a.runModal() == .alertFirstButtonReturn {
+                        NSWorkspace.shared.open(URL(string: "https://github.com/\(Updater.repo)/releases/latest")!)
+                    }
+                }
+            }
+        }
+    }
+
     @objc func menuLogin() {
         if Agents.isInstalled(Agents.loginLabel) { Agents.remove(Agents.loginLabel) }
-        else { try? Agents.install(Agents.loginLabel, arguments: [], interval: nil, load: false) }
+        else { try? Agents.install(Agents.loginLabel, arguments: ["--in-background"], interval: nil, load: false) }
     }
 }
 
@@ -1356,6 +1876,14 @@ With no arguments it runs as a menu bar app. From a terminal:
   --stop-keeping NAME         Stop doing that
   --watch                     One pass of that check (the launch agent runs it)
   --open-at-login on|off      Start the switcher when you log in
+  --route-sign-ins            Send each browser sign-in to the account that asked for it
+  --revert                    Give claude:// links back to Claude
+  --open-links-in NAME        Where other claude:// links open while routing is on
+  --open-link URL [--account NAME]
+                              Open a claude:// link in one account
+  --status                    Sign-in routing and the claude:// handler
+  --check-update              Is there a newer switcher?
+  --update                    Install it (checksum verified), then restart the switcher
   --doctor                    What a bug report needs, user name redacted
   --uninstall [--remove-profiles]
                               Remove what the switcher made outside your accounts
@@ -1394,6 +1922,50 @@ func runCommandLine(_ args: [String]) throws -> Bool {
     }
     if args.contains("--list") { print(listText()); return true }
     if args.contains("--doctor") { print(Maintenance.doctor()); return true }
+    if args == ["--in-background"] { startInBackground = true; return false }
+    if args == ["--hold-handler"] { Router.holdLoop(20); return true }
+    if let link = value(after: "--handle-link", in: args) {
+        // What the app does when macOS hands it a link; here for scripts and the tests.
+        Router.handle(link)
+        return true
+    }
+    if args.contains("--route-sign-ins") {
+        try Router.enable()
+        print("Sign-ins now go to the account that asked for them. claude:// links open in: \(Router.handlerName()).")
+        print("The first time, macOS asks whether the switcher may control Claude: allow it, so it can hand the link over.")
+        return true
+    }
+    if args.contains("--revert") {
+        let note = try Router.disable()
+        print("Sign-in routing is off. claude:// links open in: \(Router.handlerName()).")
+        if let n = note { print(n) }
+        return true
+    }
+    if args.contains("--status") { print(Router.statusText()); return true }
+    if let name = value(after: "--open-links-in", in: args) {
+        if name == defaultID { try Settings.set("OpenLinksIn", nil); print("Other links open in 'Default'."); return true }
+        let p = try Profiles.resolveOrThrow(name)
+        try Settings.set("OpenLinksIn", p.isDefault ? nil : p.id)
+        print("Other links open in '\(p.name)'.")
+        return true
+    }
+    if let link = value(after: "--open-link", in: args) {
+        guard Router.isSafe(link) else { throw SwitcherError("That is not a claude:// link.") }
+        let target = try value(after: "--account", in: args).map { try Profiles.resolveOrThrow($0) } ?? Router.otherLinkTarget() ?? Profiles.resolveOrThrow(defaultID)
+        let how = try Router.deliver(link, to: target)
+        print("Opened the link in '\(target.name)' (\(how)).")
+        return true
+    }
+    if args.contains("--check-update") {
+        if let v = try Updater.check() { print("Version \(v) is available (this is \(switcherVersion)). Install it with --update.") }
+        else { print("Claude Profile Switcher \(switcherVersion) is up to date.") }
+        return true
+    }
+    if args.contains("--update") {
+        if let v = try Updater.install() { print("Updated to \(v). Quit and reopen the switcher to use it.") }
+        else { print("Claude Profile Switcher \(switcherVersion) is up to date.") }
+        return true
+    }
     if args.contains("--uninstall") {
         for line in Maintenance.uninstall(removeProfiles: args.contains("--remove-profiles")) { print("- \(line)") }
         return true
@@ -1418,7 +1990,7 @@ func runCommandLine(_ args: [String]) throws -> Bool {
         return true
     }
     if let mode = value(after: "--open-at-login", in: args) {
-        if mode == "on" { try Agents.install(Agents.loginLabel, arguments: [], interval: nil, load: false); print("The switcher opens when you log in.") }
+        if mode == "on" { try Agents.install(Agents.loginLabel, arguments: ["--in-background"], interval: nil, load: false); print("The switcher opens when you log in.") }
         else { Agents.remove(Agents.loginLabel); print("The switcher no longer opens at login.") }
         return true
     }
@@ -1542,6 +2114,11 @@ func runCommandLine(_ args: [String]) throws -> Bool {
 
 // MARK: - Entry point
 
+/// Set by --in-background (the login agent): start in the menu bar without the window.
+var startInBackground = false
+/// True once the menu bar app runs, rather than a one-off command.
+var runningAsMenuBarApp = false
+
 let arguments = Array(CommandLine.arguments.dropFirst())
 do {
     if try runCommandLine(arguments) { exit(0) }
@@ -1552,10 +2129,12 @@ do {
 // One switcher at a time: a second copy asks the first to show its window, then leaves.
 if let id = Bundle.main.bundleIdentifier,
    NSRunningApplication.runningApplications(withBundleIdentifier: id).contains(where: { $0.processIdentifier != getpid() }) {
+    if startInBackground { exit(0) }
     DistributedNotificationCenter.default().postNotificationName(AppDelegate.showNotification, object: nil, userInfo: nil, deliverImmediately: true)
     exit(0)
 }
 
+runningAsMenuBarApp = true
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()
