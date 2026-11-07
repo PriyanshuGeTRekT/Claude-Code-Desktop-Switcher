@@ -27,7 +27,7 @@ PY
 
 install -m 755 "$here/claude-switcher" "$out/claude-switcher"
 
-# .deb
+# .deb, xz-compressed: zstd (the newer default) is not understood by older dpkg
 pkg="$(mktemp -d)/claude-profile-switcher_${version}_all"
 install -Dm 755 "$here/claude-switcher" "$pkg/usr/bin/claude-switcher"
 mkdir -p "$pkg/usr/share/icons/hicolor/scalable/apps" "$pkg/usr/share/applications" "$pkg/usr/share/doc/claude-profile-switcher" "$pkg/DEBIAN"
@@ -63,7 +63,7 @@ Description: Run several Claude desktop accounts at once
  launchers per account, Claude Code chat transfer between accounts and sign-in routing.
  Unofficial; not affiliated with Anthropic.
 EOF
-dpkg-deb --root-owner-group --build "$pkg" "$out/claude-profile-switcher_all.deb" >/dev/null
+dpkg-deb --root-owner-group -Zxz --build "$pkg" "$out/claude-profile-switcher_all.deb" >/dev/null
 
 # tarball
 tarroot="$(mktemp -d)/ClaudeProfileSwitcher-linux"
