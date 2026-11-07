@@ -1042,7 +1042,7 @@ final class AccountsWindow: NSObject, NSWindowDelegate {
         let colours = NSSegmentedControl()
         let env = NSTextView(frame: NSRect(x: 0, y: 0, width: 404, height: 80))
         let flags = NSTextField(frame: NSRect(x: 0, y: 64, width: 420, height: 24))
-        let keep = NSButton(checkboxWithTitle: "Keep running: reopen it when a Claude update, a logoff or a restart closes it", target: nil, action: nil)
+        let keep = NSButton(checkboxWithTitle: "Keep running after Claude updates and restarts", target: nil, action: nil)
 
         init(_ p: Profile) {
             func label(_ text: String, _ y: CGFloat, small: Bool = false) {
@@ -1084,7 +1084,7 @@ final class AccountsWindow: NSObject, NSWindowDelegate {
             keep.frame = NSRect(x: 0, y: 14, width: 420, height: 22)
             keep.state = AccountSettings.isKept(p.id) ? .on : .off
             view.addSubview(keep)
-            label("Checked every two minutes. Quitting it yourself leaves it closed.", -2, small: true)
+            label("Reopened within two minutes when they close it. Quitting it yourself leaves it closed.", -2, small: true)
         }
     }
 
@@ -1501,7 +1501,21 @@ func runCommandLine(_ args: [String]) throws -> Bool {
         guard let frame = alert.window.contentView?.superview ?? alert.window.contentView,
               let rep = frame.bitmapImageRepForCachingDisplay(in: frame.bounds) else { throw SwitcherError("Could not render the dialog.") }
         frame.cacheDisplay(in: frame.bounds, to: rep)
-        guard let png = rep.representation(using: .png, properties: [:]) else { throw SwitcherError("Could not render the dialog.") }
+        // The dialog's own backdrop is a blur that a cached drawing leaves out, so lay the
+        // rendering over the window colour of the same appearance.
+        guard let out = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: rep.pixelsWide, pixelsHigh: rep.pixelsHigh, bitsPerSample: 8,
+                                         samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+        else { throw SwitcherError("Could not render the dialog.") }
+        out.size = rep.size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: out)
+        alert.window.effectiveAppearance.performAsCurrentDrawingAppearance {
+            NSColor.windowBackgroundColor.setFill()
+            NSRect(origin: .zero, size: rep.size).fill()
+        }
+        rep.draw(in: NSRect(origin: .zero, size: rep.size))
+        NSGraphicsContext.restoreGraphicsState()
+        guard let png = out.representation(using: .png, properties: [:]) else { throw SwitcherError("Could not render the dialog.") }
         try png.write(to: URL(fileURLWithPath: path))
         return true
     }
