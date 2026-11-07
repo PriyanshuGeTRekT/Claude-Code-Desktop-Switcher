@@ -1124,7 +1124,9 @@ final class AccountsWindow: NSObject, NSWindowDelegate {
             let oldArgs = AccountSettings.argsText(p.id)
             let newArgs = form.flags.stringValue.trimmingCharacters(in: .whitespaces)
             try Settings.setEntry("ProfileEnv", id: p.id, value: parsed.vars.isEmpty ? nil : parsed.vars)
-            try Settings.setEntry("ProfileArgs", id: p.id, value: newArgs.isEmpty ? nil : newArgs)
+            // Untouched flags keep their saved form: a list can hold quotes that the one-line
+            // text cannot carry back.
+            if newArgs != oldArgs { try Settings.setEntry("ProfileArgs", id: p.id, value: newArgs.isEmpty ? nil : newArgs) }
             let launchChanged = AccountSettings.envText(p.id) != oldEnv || newArgs != oldArgs
             if !p.isDefault, form.colours.selectedSegment >= 0, form.colours.selectedSegment != Palette.index(for: p.id) {
                 try Settings.setEntry("ChosenColors", id: p.id, value: form.colours.selectedSegment)
