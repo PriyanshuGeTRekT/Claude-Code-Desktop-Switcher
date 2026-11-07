@@ -1261,8 +1261,8 @@ def gtk_available():
     try:
         import gi
         gi.require_version("Gtk", "3.0")
-        from gi.repository import Gtk  # noqa: F401
-        return True
+        from gi.repository import Gtk
+        return Gtk is not None
     except Exception:
         return False
 
