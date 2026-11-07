@@ -396,6 +396,18 @@ function Get-UpdateTarget {
     return $script:ScriptPath
 }
 
+# The version of the file an update would replace, which is not always the running one:
+# a copy run from a download or the repo updates the installed copy. A file from before
+# the version line (2.3.0) counts as 0, so anything versioned is newer than it.
+function Get-UpdateTargetVersion {
+    $target = Get-UpdateTarget
+    if ($target -eq $script:ScriptPath) { return $script:SwitcherVersion }
+    if (-not (Test-Path -LiteralPath $target)) { return '0' }
+    $found = Get-ScriptVersion -Text (Get-Content -LiteralPath $target -Raw)
+    if ($found) { return $found }
+    return '0'
+}
+
 function Get-WebFile {
     param([Parameter(Mandatory)][string]$Url, [Parameter(Mandatory)][string]$Path)
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -441,7 +453,7 @@ function Find-SwitcherUpdate {
         Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
         throw
     }
-    if (-not $found -or (Compare-SwitcherVersion -A $found -B $script:SwitcherVersion) -le 0) {
+    if (-not $found -or (Compare-SwitcherVersion -A $found -B (Get-UpdateTargetVersion)) -le 0) {
         # A different file that is not newer: a release from before the version line, a
         # development build here, or a re-published release. Not an update.
         Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
@@ -457,7 +469,7 @@ function Install-SwitcherUpdate {
     try { Unblock-File -LiteralPath $target } catch { }
     Remove-Item -LiteralPath $Found.Path -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $script:UpdateInfoPath -Force -ErrorAction SilentlyContinue
-    Write-UpdateLog "Installed $($Found.Version) over $($script:SwitcherVersion) at $target."
+    Write-UpdateLog "Installed $($Found.Version) over $(Get-UpdateTargetVersion) at $target."
 }
 
 function Test-SwitcherRunning {
@@ -868,7 +880,8 @@ function Get-ClaudeProcessFamily {
 
 # Closes the main window politely, waits up to GraceSeconds for the process to leave on
 # its own, then ends it and whatever of its family is still there, and waits for them to
-# go. Pure process work, so the tests can run it on a stand-in.
+# go. Returns the ids still running after that, which is empty unless Windows refused
+# (an elevated Claude, for one). Pure process work, so the tests can run it on a stand-in.
 function Stop-ProcessGroup {
     param([Parameter(Mandatory)][int[]]$ProcessIds, [Parameter(Mandatory)][int]$MainProcessId, [int]$GraceSeconds = 3)
     $main = Get-Process -Id $MainProcessId -ErrorAction SilentlyContinue
@@ -880,10 +893,12 @@ function Stop-ProcessGroup {
         try { Stop-Process -Id $id -Force -ErrorAction Stop } catch { }
     }
     $until = (Get-Date).AddSeconds(5)
-    while ((Get-Date) -lt $until) {
-        if (-not @($ProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })) { break }
-        Start-Sleep -Milliseconds 200
+    $left  = @($ProcessIds)
+    while ($left.Count -and (Get-Date) -lt $until) {
+        $left = @($ProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+        if ($left.Count) { Start-Sleep -Milliseconds 200 }
     }
+    return $left
 }
 
 # Ends one account's Claude. Returns 'closed', or 'not running'. Asked to close its
@@ -894,7 +909,13 @@ function Stop-ClaudeProfile {
     $path = Get-ProfilePath -Id $Id
     $main = (Get-RunningProfileMap)[$path.TrimEnd('\')]
     if (-not $main) { return 'not running' }
-    Stop-ProcessGroup -ProcessIds (Get-ClaudeProcessFamily -MainProcessId $main) -MainProcessId $main -GraceSeconds $GraceSeconds
+    $left = @(Stop-ProcessGroup -ProcessIds (Get-ClaudeProcessFamily -MainProcessId $main) -MainProcessId $main -GraceSeconds $GraceSeconds)
+    # The main process is what holds the account's single-instance lock. While it lives,
+    # a restart would only hand the launch back to it, so this is a failure, not 'closed'.
+    if ($left -contains $main) {
+        $who = $(try { (Resolve-ClaudeProfile -Name $Id -SkipStatus).Name } catch { $Id })
+        throw "Windows would not let the switcher end '$who' (process $main). It may be running as administrator; close it from its own window or tray icon."
+    }
     return 'closed'
 }
 
@@ -3030,7 +3051,14 @@ function Invoke-RestartProfile {
     if (-not $Target) { return }
     $statusLine.Text = "Restarting '$($Target.Name)'..."
     [System.Windows.Forms.Application]::DoEvents()
-    try { Stop-ClaudeProfile -Id $Target.Id | Out-Null } catch { }
+    try {
+        Stop-ClaudeProfile -Id $Target.Id | Out-Null
+    } catch {
+        # Launching now would only bring the old copy forward, with its old flags.
+        Show-Message $_.Exception.Message 'Could not restart' 'OK' 'Error' | Out-Null
+        Update-List -Force
+        return
+    }
     Invoke-LaunchProfile -Target $Target
 }
 
@@ -3042,7 +3070,7 @@ function Read-UpdateInfo {
     if (-not (Test-Path -LiteralPath $script:UpdateInfoPath)) { return }
     try {
         $info = Get-Content -LiteralPath $script:UpdateInfoPath -Raw | ConvertFrom-Json
-        if ((Compare-SwitcherVersion -A ([string]$info.Version) -B $script:SwitcherVersion) -gt 0) { $script:UpdateAvailable = [string]$info.Version }
+        if ((Compare-SwitcherVersion -A ([string]$info.Version) -B (Get-UpdateTargetVersion)) -gt 0) { $script:UpdateAvailable = [string]$info.Version }
     } catch { }
 }
 
@@ -3077,7 +3105,7 @@ function Invoke-UpdateSwitcher {
         Show-Message "You have the latest version ($($script:SwitcherVersion))." 'Update' | Out-Null
         return
     }
-    $answer = Show-Message "Version $($found.Version) is available; you have $($script:SwitcherVersion).`n`nInstall it now? The switcher closes and opens again. Your accounts are not touched." 'Update' 'YesNo' 'Question'
+    $answer = Show-Message "Version $($found.Version) is available; you have $(Get-UpdateTargetVersion).`n`nInstall it now? The switcher closes and opens again. Your accounts are not touched." 'Update' 'YesNo' 'Question'
     if ($answer -ne 'Yes') {
         Remove-Item -LiteralPath $found.Path -Force -ErrorAction SilentlyContinue
         Update-List -Force
@@ -3184,7 +3212,9 @@ function Show-EditDialog {
     $flags.Location = New-Object System.Drawing.Point(18, 298)
     $flags.Size     = New-Object System.Drawing.Size(430, 26)
     $flags.Font     = New-Object System.Drawing.Font('Consolas', 9.5)
-    $flags.Text     = [string](Get-ProfileMap -Setting 'ProfileArgs')[$Target.Id]
+    # Through Get-ProfileArgs, which quotes list items that contain spaces, so saving keeps
+    # each one a single argument.
+    $flags.Text     = Get-ProfileArgs -Id $Target.Id
     $flags.Enabled  = -not $storeDefault
     $dlg.Controls.Add($flags)
     Add-Label $(if ($storeDefault) { 'Your original account starts through the Store, which takes no variables or flags.' }
@@ -3222,6 +3252,13 @@ function Invoke-EditProfile {
     if (-not $p) { return }
     $entered = Show-EditDialog -Target $p
     if (-not $entered) { return }
+    # The name is the one field that can be refused, so it is checked before anything is
+    # saved: a refused edit then changes nothing.
+    $renaming = ($entered.Name -and $entered.Name -cne $p.Name)
+    if ($renaming) {
+        $err = Test-ProfileName -Name $entered.Name -ExceptId $p.Id
+        if ($err) { Show-Message "$err`n`nNothing was saved." 'Could not save' 'OK' 'Warning' | Out-Null; return }
+    }
     try {
         $parsed = ConvertFrom-EnvLines -Text $entered.EnvText
         if ($parsed.Invalid.Count) {
@@ -3231,7 +3268,7 @@ function Invoke-EditProfile {
         $launchChanged = $false
         if (-not $storeDefault) {
             $oldEnv  = ConvertTo-EnvLines -Vars (Get-ProfileMap -Setting 'ProfileEnv')[$p.Id]
-            $oldArgs = [string](Get-ProfileMap -Setting 'ProfileArgs')[$p.Id]
+            $oldArgs = Get-ProfileArgs -Id $p.Id
             Set-ProfileMapEntry -Setting 'ProfileEnv'  -Id $p.Id -Value $(if ($parsed.Vars.Count) { $parsed.Vars } else { $null })
             Set-ProfileMapEntry -Setting 'ProfileArgs' -Id $p.Id -Value $(if ($entered.Flags) { $entered.Flags } else { $null })
             $launchChanged = ((ConvertTo-EnvLines -Vars $parsed.Vars) -ne $oldEnv) -or ($entered.Flags -ne $oldArgs)
@@ -3251,7 +3288,7 @@ function Invoke-EditProfile {
             $removed = @(Remove-ProfileShortcuts -Label $current.Name)
             foreach ($lnk in $removed) { New-ProfileShortcut -Target $current -Directory (Split-Path $lnk -Parent) | Out-Null }
         }
-        if ($entered.Name -and $entered.Name -cne $p.Name) {
+        if ($renaming) {
             $current = Rename-ClaudeProfile -Target $current -NewName $entered.Name
         }
         try { Update-RunningProfileIdentity } catch { }
