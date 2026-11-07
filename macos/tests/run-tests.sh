@@ -84,7 +84,8 @@ check "--rename reports the new name" 'echo "$out" | grep -q "Renamed .Account 2
 check "--list shows the label and the folder" 'sw --list | grep -q "^Work \[Account 2\]"'
 check "--launch finds it by its new name" 'sw --launch Work | grep -q "Switched to .Work."'
 check "a taken name is refused" '! sw --rename Work Default >/dev/null'
-check "an unknown name is refused, listing the accounts" 'sw --launch Nope | grep -q "Profiles: Default, Work"'
+out="$(sw --launch Nope)"; status=$?
+check "an unknown name is refused, listing the accounts" '[ "$status" -ne 0 ] && echo "$out" | grep -q "Profiles: Default, Work"'
 out="$(sw --quit Work)"
 check "--quit reports it" 'echo "$out" | grep -q "Quit .Work."'
 check "Work is no longer open" 'wait_open "Work" closed'
