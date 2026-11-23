@@ -897,8 +897,29 @@ function Start-ClaudeProcess {
         $vars = (Get-Setting 'ProfileEnv').$Id
         if ($vars -and @($vars.PSObject.Properties).Count) { $note += " Its environment variables could not be passed this way." }
         try { Add-Content -LiteralPath $script:LogPath -Value ('[{0}] {1}' -f (Get-Date -Format 's'), $note) } catch { }
-        return (Get-Process -Id $processId -ErrorAction SilentlyContinue)
+        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+        # Activation has no "start minimized". The watchdog reopens accounts minimized so
+        # they never jump in front of what you are doing, so do it as the window appears.
+        if ($WindowStyle -eq 'Minimized' -and $process) { Set-ProcessWindowMinimized -Process $process }
+        return $process
     }
+}
+
+# Minimizes a new process's main window as soon as it has one, without activating it.
+function Set-ProcessWindowMinimized {
+    param([Parameter(Mandatory)]$Process, [int]$TimeoutSeconds = 20)
+    try {
+        Initialize-Native
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        while ((Get-Date) -lt $deadline -and -not $Process.HasExited) {
+            $Process.Refresh()
+            if ($Process.MainWindowHandle -ne [IntPtr]::Zero) {
+                [Native.WinApi]::ShowWindow($Process.MainWindowHandle, 7) | Out-Null   # SW_SHOWMINNOACTIVE
+                return
+            }
+            Start-Sleep -Milliseconds 100
+        }
+    } catch { }
 }
 
 # Returns 'focused' when the profile was already open, 'started' otherwise.

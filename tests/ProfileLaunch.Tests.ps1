@@ -148,6 +148,15 @@ $logText = Get-Content -LiteralPath $script:LogPath -Raw
 Assert ($logText -match 'app activation' -and $logText -match 'environment variables') 'Fallback not logged with the variables note'
 Remove-Item -LiteralPath $script:LogPath -Force
 
+# A minimized launch (the watchdog's) stays minimized through the fallback.
+$script:Minimized = @()
+function Set-ProcessWindowMinimized { param($Process, $TimeoutSeconds) $script:Minimized += $Process.Id }
+Start-ClaudeProcess -Id 'Work' -ArgLine 'x' -WindowStyle Minimized | Out-Null
+Assert ($script:Minimized.Count -eq 1 -and $script:Minimized[0] -eq $PID) 'Fallback did not keep a minimized launch minimized'
+Start-ClaudeProcess -Id 'Work' -ArgLine 'x' | Out-Null
+Assert ($script:Minimized.Count -eq 1) 'A normal launch was minimized'
+Remove-Item -LiteralPath $script:LogPath -Force
+
 # The installer build has no package to activate: the error is reported as it was.
 $script:ClaudeApp = [pscustomobject]@{ Kind = 'Classic'; AppUserModelId = $null }
 $script:Activated = @()
