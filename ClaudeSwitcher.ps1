@@ -835,6 +835,93 @@ function Get-LaunchArgLine {
     return ($parts -join ' ')
 }
 
+# Windows' own way to start a packaged (Store) app with a command line. It gives the new
+# process the package identity, as starting it from the Start menu does.
+$script:PackagedActivationSource = @'
+using System;
+using System.Runtime.InteropServices;
+namespace ClaudeSwitcherNative {
+    [ComImport, Guid("2e941141-7f97-4756-ba1d-9decde894a3d"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IApplicationActivationManager {
+        [PreserveSig] int ActivateApplication([MarshalAs(UnmanagedType.LPWStr)] string appUserModelId,
+            [MarshalAs(UnmanagedType.LPWStr)] string arguments, int options, out uint processId);
+    }
+    [ComImport, Guid("45BA127D-10A8-46EA-8AB7-56EA9078943C")]
+    class ApplicationActivationManager { }
+    public static class PackagedApp {
+        // AO_NOERRORUI: report a failure to the caller instead of showing Windows' own dialog.
+        public static uint Activate(string appUserModelId, string arguments) {
+            var manager = (IApplicationActivationManager)new ApplicationActivationManager();
+            uint pid;
+            int hr = manager.ActivateApplication(appUserModelId, arguments, 0x2, out pid);
+            if (hr < 0) { Marshal.ThrowExceptionForHR(hr); }
+            return pid;
+        }
+    }
+}
+'@
+
+function Invoke-PackagedActivation {
+    param([Parameter(Mandatory)][string]$AppUserModelId, [string]$Arguments)
+    if (-not ('ClaudeSwitcherNative.PackagedApp' -as [type])) { Add-Type -TypeDefinition $script:PackagedActivationSource }
+    return [int][ClaudeSwitcherNative.PackagedApp]::Activate($AppUserModelId, $Arguments)
+}
+
+<#
+    Starts Claude.exe with this command line for one account and returns the process.
+
+    On the Store build, Windows can refuse to run Claude.exe straight from its protected
+    install folder: "This command cannot be run due to the error: Access is denied."
+    It was reported on Windows 10 IoT LTSC after Claude was reinstalled (issue #28), while
+    the original account, which already starts through the shell, kept working. Claude is
+    then started through Windows' activation for packaged apps, which passes the same
+    command line. That route cannot carry the account's own environment variables,
+    because the new process is started by Windows rather than by the switcher, so it is
+    only a fallback, and the log says so when variables were set.
+#>
+function Start-ClaudeProcess {
+    param([Parameter(Mandatory)][string]$Id, [string]$ArgLine, [string]$WindowStyle = 'Normal')
+    $launch = @{ FilePath = $script:ClaudeExe; WindowStyle = $WindowStyle; PassThru = $true; ErrorAction = 'Stop' }
+    if ($ArgLine) { $launch.ArgumentList = $ArgLine }
+    try {
+        return (Invoke-WithProfileEnv -Id $Id { Start-Process @launch })
+    } catch {
+        $direct = $_
+        if ($script:ClaudeApp.Kind -ne 'Msix' -or -not $script:ClaudeApp.AppUserModelId) { throw }
+        try {
+            $processId = Invoke-PackagedActivation -AppUserModelId $script:ClaudeApp.AppUserModelId -Arguments $ArgLine
+        } catch {
+            throw "Could not start Claude for '$Id'.`r`n`r`nStarting Claude.exe directly failed: $($direct.Exception.Message)`r`nStarting it as a Store app failed too: $($_.Exception.Message)"
+        }
+        $note = "Started '$Id' through Windows' app activation, because starting Claude.exe directly failed: $($direct.Exception.Message)"
+        $vars = (Get-Setting 'ProfileEnv').$Id
+        if ($vars -and @($vars.PSObject.Properties).Count) { $note += " Its environment variables could not be passed this way." }
+        try { Add-Content -LiteralPath $script:LogPath -Value ('[{0}] {1}' -f (Get-Date -Format 's'), $note) } catch { }
+        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+        # Activation has no "start minimized". The watchdog reopens accounts minimized so
+        # they never jump in front of what you are doing, so do it as the window appears.
+        if ($WindowStyle -eq 'Minimized' -and $process) { Set-ProcessWindowMinimized -Process $process }
+        return $process
+    }
+}
+
+# Minimizes a new process's main window as soon as it has one, without activating it.
+function Set-ProcessWindowMinimized {
+    param([Parameter(Mandatory)]$Process, [int]$TimeoutSeconds = 20)
+    try {
+        Initialize-Native
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        while ((Get-Date) -lt $deadline -and -not $Process.HasExited) {
+            $Process.Refresh()
+            if ($Process.MainWindowHandle -ne [IntPtr]::Zero) {
+                [Native.WinApi]::ShowWindow($Process.MainWindowHandle, 7) | Out-Null   # SW_SHOWMINNOACTIVE
+                return
+            }
+            Start-Sleep -Milliseconds 100
+        }
+    } catch { }
+}
+
 # Returns 'focused' when the profile was already open, 'started' otherwise.
 function Start-ClaudeProfile {
     param([Parameter(Mandatory)][string]$Id, [switch]$Minimized)
@@ -882,7 +969,7 @@ function Start-ClaudeProfile {
     $argLine = Get-LaunchArgLine -Id $Id -Path $path
     # Minimized is best effort: it goes in STARTUPINFO, which Electron may or may not honour.
     $show = $(if ($Minimized) { 'Minimized' } else { 'Normal' })
-    $script:LaunchedProcess = Invoke-WithProfileEnv -Id $Id { Start-Process -FilePath $script:ClaudeExe -ArgumentList $argLine -WindowStyle $show -PassThru }
+    $script:LaunchedProcess = Start-ClaudeProcess -Id $Id -ArgLine $argLine -WindowStyle $show
     return $(if ($open) { 'focused' } else { 'started' })
 }
 
@@ -2267,7 +2354,7 @@ function Start-ClaudeWithLink {
     $id = $(if ($Target) { $Target.Id } else { $script:DefaultName })
     $argLine = Get-LaunchArgLine -Id $id -Path $(if ($Target -and -not $Target.IsDefault) { $Target.Path } else { '' }) -Link $Link
     # Kept so a window started this way can be given the account's taskbar identity.
-    $script:LaunchedProcess = Invoke-WithProfileEnv -Id $id { Start-Process -FilePath $script:ClaudeExe -ArgumentList $argLine -WindowStyle Normal -PassThru }
+    $script:LaunchedProcess = Start-ClaudeProcess -Id $id -ArgLine $argLine
 }
 
 # Where a claude:// link that is not a sign-in goes while routing is on: the account the

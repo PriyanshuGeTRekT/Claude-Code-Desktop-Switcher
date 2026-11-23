@@ -3,7 +3,7 @@ $source = Join-Path (Split-Path $PSScriptRoot -Parent) 'ClaudeSwitcher.ps1'
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$null, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in @('Invoke-WithProfileEnv', 'Get-ProfileArgs', 'Get-LaunchArgLine', 'Get-OtherLinkTarget', 'Test-SafeLink')) {
+foreach ($name in @('Invoke-WithProfileEnv', 'Get-ProfileArgs', 'Get-LaunchArgLine', 'Get-OtherLinkTarget', 'Test-SafeLink', 'Start-ClaudeProcess')) {
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}, $true)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
@@ -129,4 +129,54 @@ $before = $script:Launched.Count
 Invoke-SignInRouter -Link 'claude://claude.ai/new" -Revert'
 Assert ($script:Launched.Count -eq $before -and $script:Log[-1] -like 'Refused*') 'An unsafe link was launched'
 
-Write-Output 'PASS: environment per account (set, skipped, restored, not leaked, failed launch), flags per account (string, array, line breaks), launch line order, OpenLinksIn by id and label with Default and missing profiles, link check, router with routing off, other links with and without OpenLinksIn, sign-ins, unsafe links.'
+
+# Issue #28: Windows can refuse to run the Store build's Claude.exe directly. Claude is
+# then started through packaged-app activation with the same command line.
+$script:ClaudeExe = 'C:\Program Files\WindowsApps\Claude_1.0.0.0_x64__test\app\Claude.exe'
+$script:LogPath = Join-Path ([IO.Path]::GetTempPath()) ('claude-switcher-test-' + [guid]::NewGuid().ToString('N') + '.log')
+$script:Activated = @()
+function Start-Process { param($FilePath, $ArgumentList, $WindowStyle, [switch]$PassThru, $ErrorAction) throw 'This command cannot be run due to the error: Access is denied.' }
+function Invoke-PackagedActivation { param($AppUserModelId, $Arguments) $script:Activated += ,@{ Aumid = $AppUserModelId; Args = $Arguments }; return $PID }
+$script:ClaudeApp = [pscustomobject]@{ Kind = 'Msix'; AppUserModelId = 'Claude_test!Claude' }
+$script:Settings = @{ ProfileEnv = [pscustomobject]@{ Work = [pscustomobject]@{ A = '1' } } }
+$proc = Start-ClaudeProcess -Id 'Work' -ArgLine '"--user-data-dir=C:\w"'
+Assert ($script:Activated.Count -eq 1) 'Store build: no fallback to packaged activation'
+Assert ($script:Activated[0].Aumid -eq 'Claude_test!Claude') 'Fallback used the wrong app id'
+Assert ($script:Activated[0].Args -eq '"--user-data-dir=C:\w"') 'Fallback lost the command line'
+Assert ($proc.Id -eq $PID) 'Fallback did not return the started process'
+$logText = Get-Content -LiteralPath $script:LogPath -Raw
+Assert ($logText -match 'app activation' -and $logText -match 'environment variables') 'Fallback not logged with the variables note'
+Remove-Item -LiteralPath $script:LogPath -Force
+
+# A minimized launch (the watchdog's) stays minimized through the fallback.
+$script:Minimized = @()
+function Set-ProcessWindowMinimized { param($Process, $TimeoutSeconds) $script:Minimized += $Process.Id }
+Start-ClaudeProcess -Id 'Work' -ArgLine 'x' -WindowStyle Minimized | Out-Null
+Assert ($script:Minimized.Count -eq 1 -and $script:Minimized[0] -eq $PID) 'Fallback did not keep a minimized launch minimized'
+Start-ClaudeProcess -Id 'Work' -ArgLine 'x' | Out-Null
+Assert ($script:Minimized.Count -eq 1) 'A normal launch was minimized'
+Remove-Item -LiteralPath $script:LogPath -Force
+
+# The installer build has no package to activate: the error is reported as it was.
+$script:ClaudeApp = [pscustomobject]@{ Kind = 'Classic'; AppUserModelId = $null }
+$script:Activated = @()
+$failed = $false
+try { Start-ClaudeProcess -Id 'Work' -ArgLine 'x' | Out-Null } catch { $failed = $true }
+Assert ($failed -and $script:Activated.Count -eq 0) 'Installer build: error swallowed or activation tried'
+
+# When both routes fail, the message names both.
+$script:ClaudeApp = [pscustomobject]@{ Kind = 'Msix'; AppUserModelId = 'Claude_test!Claude' }
+function Invoke-PackagedActivation { param($AppUserModelId, $Arguments) throw 'Class not registered' }
+$msg = ''
+try { Start-ClaudeProcess -Id 'Work' -ArgLine 'x' | Out-Null } catch { $msg = $_.Exception.Message }
+Assert ($msg -match 'Access is denied' -and $msg -match 'Class not registered') 'Both failures not reported'
+
+# A direct start that works never touches the fallback.
+function Start-Process { param($FilePath, $ArgumentList, $WindowStyle, [switch]$PassThru, $ErrorAction) return [pscustomobject]@{ Id = 4242; Args = $ArgumentList } }
+function Invoke-PackagedActivation { param($AppUserModelId, $Arguments) throw 'should not be called' }
+$proc = Start-ClaudeProcess -Id 'Work' -ArgLine 'x'
+Assert ($proc.Id -eq 4242 -and $proc.Args -eq 'x') 'Direct start not used'
+$proc = Start-ClaudeProcess -Id 'Work'
+Assert ($proc.Id -eq 4242 -and $null -eq $proc.Args) 'Empty command line passed to Start-Process'
+
+Write-Output 'PASS: environment per account (set, skipped, restored, not leaked, failed launch), flags per account (string, array, line breaks), launch line order, OpenLinksIn by id and label with Default and missing profiles, link check, router with routing off, other links with and without OpenLinksIn, sign-ins, unsafe links, the Store-app fallback when Claude.exe cannot be started directly.'
