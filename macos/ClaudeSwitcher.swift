@@ -12,7 +12,7 @@ import CoreServices
 import CryptoKit
 import Foundation
 
-let switcherVersion = "2.4.0"
+let switcherVersion = "2.4.1"
 let defaultID = "Default"
 
 struct SwitcherError: LocalizedError {
