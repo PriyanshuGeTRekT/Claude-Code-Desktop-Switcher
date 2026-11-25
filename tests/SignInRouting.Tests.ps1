@@ -7,7 +7,7 @@ foreach ($name in @('Get-Setting','Test-SignInRoutingOn','Test-SafeLink','Test-S
                     'Set-PendingSignIn','Get-PendingSignIn','Clear-PendingSignIn','Select-SignInTarget','Get-LauncherScript',
                     'Get-RouterCommand','Get-LauncherCommand','Get-ShortcutStyle','Get-RegistryDefault','Set-RegistryValue','Get-RouterRegistryPath','Test-RouterRegistered',
                     'Register-SignInRouter','Test-RouterChosen','Unregister-SignInRouter','Set-Setting','Write-RouterLog',
-                    'Disable-SignInRouting','Test-HandleLinkAlone')) {
+                    'Disable-SignInRouting','Test-HandleLinkAlone','Get-PackageCachePath')) {
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}, $true)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
