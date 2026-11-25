@@ -374,7 +374,9 @@ or tokens: you sign in to each account in Claude itself.
 - **Two builds of Claude**, both detected: the Store (MSIX) build, whose original data lives in
   `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude` and which the switcher starts
   through the shell so it keeps auto-update and `claude://` links; and the installer build,
-  with its data in `%APPDATA%\Claude`.
+  with its data in `%APPDATA%\Claude`. Newer builds move that data to
+  `%LOCALAPPDATA%\Claude-Data\<name>` and leave a `.user-data-left.<name>` marker behind; the
+  switcher follows the marker, so Default's chats, sign-in state and last use are read there.
 - **Extra accounts live in `%LOCALAPPDATA%\ClaudeProfile-<name>`**, directly under
   `%LOCALAPPDATA%`, because Cowork's local VM service only finds its disk image there. Older
   versions used `%LOCALAPPDATA%\ClaudeProfiles\<name>`; those move once, and a link left at

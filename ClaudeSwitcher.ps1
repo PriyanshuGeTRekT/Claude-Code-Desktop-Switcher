@@ -266,6 +266,11 @@ function New-InstallInfo {
 
     The install path contains the version number and therefore changes each time the
     app updates itself, so a found path is only ever trusted while it still exists.
+
+    Those are the folders Claude was installed with. Newer builds (seen on Store 6.28899)
+    move the data out of them, see Resolve-ClaudeDataPath, so DefaultProfilePath here is
+    only where the data started; $script:DefaultProfilePath is where it is now. The Store
+    package's LocalCache is still found from the former (Get-PackageCachePath).
 #>
 function Find-ClaudeInstall {
     # Store build.
@@ -348,11 +353,53 @@ function Resolve-ClaudeInstall {
     return $found
 }
 
+<#
+    Newer Claude builds keep their data in %LOCALAPPDATA%\Claude-Data\<name> and run with it
+    as --user-data-dir. The folder they were installed with (the Store package's
+    LocalCache\Roaming\Claude, or %APPDATA%\Claude) then holds only a marker file named
+    .user-data-left.<name>, so reading Default's chats, sign-in state or last use there
+    finds nothing: Transfer chats said Default had no chats, and refused it as a target.
+    Seen on Store 6.28899 as .user-data-left.claude_<publisher id>, next to a README.txt
+    in Claude-Data that tells people not to move anything in it.
+
+    Returns where the data in $Path lives now, or $Path when it has not moved. A marker is
+    followed only to a folder Claude has written its config.json in. Without a marker
+    (cleaned up by hand, say) and without a config.json of its own, a Store build's folder
+    is tried under its package family name, which is the name observed.
+#>
+$script:DataLeftMarker = '.user-data-left.'
+
+function Resolve-ClaudeDataPath {
+    param([string]$Path, [string]$AppUserModelId)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    # -Filter alone would also match a bare ".user-data-left": Windows wildcards let ".*" match nothing.
+    $names = @(Get-ChildItem -LiteralPath $Path -Force -File -Filter "$($script:DataLeftMarker)*" -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name.Length -gt $script:DataLeftMarker.Length -and $_.Name.StartsWith($script:DataLeftMarker, [StringComparison]::OrdinalIgnoreCase) } |
+               Sort-Object LastWriteTime -Descending | ForEach-Object { $_.Name.Substring($script:DataLeftMarker.Length) })
+    if (-not (Test-Path -LiteralPath (Join-Path $Path 'config.json')) -and $AppUserModelId -match '^([^!]+)!') {
+        $names += $Matches[1].ToLowerInvariant()
+    }
+    foreach ($name in $names) {
+        # A marker's name becomes part of a path: a plain folder name only, never .. or a separator.
+        if ($name -notmatch '^[A-Za-z0-9_-][A-Za-z0-9._-]*$') { continue }
+        $moved = Join-Path (Join-Path $env:LOCALAPPDATA 'Claude-Data') $name
+        if (Test-Path -LiteralPath (Join-Path $moved 'config.json') -PathType Leaf) { return $moved }
+    }
+    return $Path
+}
+
+# The Store package's LocalCache, which receives the package's redirected writes to
+# %LOCALAPPDATA% (see Get-CodeSessionRoot). Anchored on the folder Claude was installed
+# with, which keeps that shape even after the data itself has moved to Claude-Data.
+function Get-PackageCachePath {
+    return (Split-Path (Split-Path $script:ClaudeApp.DefaultProfilePath -Parent) -Parent)
+}
+
 function Update-ClaudeInstall {
     param([switch]$AllowCache)
     $script:ClaudeApp          = Resolve-ClaudeInstall -Override $ClaudePath -AllowCache:$AllowCache
     $script:ClaudeExe          = $script:ClaudeApp.Exe
-    $script:DefaultProfilePath = $script:ClaudeApp.DefaultProfilePath
+    $script:DefaultProfilePath = Resolve-ClaudeDataPath -Path $script:ClaudeApp.DefaultProfilePath -AppUserModelId $script:ClaudeApp.AppUserModelId
 }
 
 # Answered before looking for Claude, so it works on a machine without it.
@@ -541,7 +588,7 @@ try {
     $script:ResolveError      = $_.Exception.Message
     $script:ClaudeApp          = New-InstallInfo 'not found' '' 'unknown' $null (Join-Path $env:APPDATA 'Claude')
     $script:ClaudeExe          = ''
-    $script:DefaultProfilePath = $script:ClaudeApp.DefaultProfilePath
+    $script:DefaultProfilePath = Resolve-ClaudeDataPath -Path $script:ClaudeApp.DefaultProfilePath
 }
 if ($ClaudePath) { Set-Setting 'ClaudePath' $script:ClaudeApp.Exe }
 
@@ -2059,7 +2106,7 @@ function Get-CodeSessionRoot {
     $localPrefix = $env:LOCALAPPDATA.TrimEnd('\') + '\'
     if ($script:ClaudeApp.Kind -eq 'Msix' -and
         $TargetProfile.Path.StartsWith($localPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        $cache = Split-Path (Split-Path $script:ClaudeApp.DefaultProfilePath -Parent) -Parent
+        $cache = Get-PackageCachePath
         $relative = $TargetProfile.Path.Substring($localPrefix.Length)
         $redirected = Join-Path (Join-Path (Join-Path $cache 'Local') $relative) 'claude-code-sessions'
         if (Test-Path -LiteralPath $redirected -PathType Container) { return $redirected }
@@ -2162,7 +2209,7 @@ function Move-LegacyProfileFolder {
         # under the same relative path (see Get-CodeSessionRoot). That part moves along.
         # Left behind, those files (Code sessions among them) no longer show in the profile.
         if ($script:ClaudeApp.Kind -eq 'Msix') {
-            $cache = Join-Path (Split-Path (Split-Path $script:ClaudeApp.DefaultProfilePath -Parent) -Parent) 'Local'
+            $cache = Join-Path (Get-PackageCachePath) 'Local'
             $from  = Join-Path $cache "ClaudeProfiles\$($d.Name)"
             $to    = Join-Path $cache ($script:ProfileDirPrefix + $d.Name)
             if (Test-Path -LiteralPath $from) {
@@ -2265,7 +2312,7 @@ function Get-ProfileDataPath {
     $localPrefix = $env:LOCALAPPDATA.TrimEnd('\') + '\'
     if ($script:ClaudeApp.Kind -eq 'Msix' -and -not $Target.IsDefault -and
         $Target.Path.StartsWith($localPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        $cache = Split-Path (Split-Path $script:ClaudeApp.DefaultProfilePath -Parent) -Parent
+        $cache = Get-PackageCachePath
         $redirected = Join-Path (Join-Path $cache 'Local') $Target.Path.Substring($localPrefix.Length)
         if (Test-Path -LiteralPath (Join-Path $redirected 'config.json')) { return $redirected }
     }
